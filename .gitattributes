@@ -1,0 +1,19 @@
+# ---------------------------------------------------------------------------
+# 行尾统一为 LF —— 这条规则不受各人 core.autocrlf 设置影响。
+#
+# 为什么必须：
+#   router/ 下的脚本跑在路由器的 busybox ash 上，一旦带上 CRLF 会直接崩：
+#     Syntax error: "&&" unexpected
+#     Syntax error: word unexpected (expecting "do")
+#   配了 eol=lf 之后，即使在 Windows 上 clone，工作区也是 LF，
+#   从 Windows 直接 scp router/* 到路由器也不会再踩这个坑。
+# ---------------------------------------------------------------------------
+* text=auto eol=lf
+
+# 非文本类型：明确不做行尾转换
+*.png  binary
+*.jpg  binary
+*.gif  binary
+*.ico  binary
+*.zip  binary
+*.gz   binary
