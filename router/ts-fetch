@@ -13,7 +13,7 @@
 # daemon 启动会自行恢复连接。所以日常常驻内存的只有 tailscaled 一个，
 # 比"两个都常驻"（解压后 70.8MB）省下一半以上。
 
-. /etc/tailscale/ts.conf
+. "${TS_CONF:-/etc/tailscale/ts.conf}"
 
 log()  { logger -t ts-fetch "$*"; echo "[ts-fetch] $*"; }
 warn() { log "WARN: $*"; }

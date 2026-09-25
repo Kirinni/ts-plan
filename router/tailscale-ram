@@ -9,7 +9,7 @@ START=99
 STOP=05
 USE_PROCD=1
 
-. /etc/tailscale/ts.conf
+. "${TS_CONF:-/etc/tailscale/ts.conf}"
 
 TS_DAEMON="$TS_DIR/tailscaled"
 TS_CLI="$TS_DIR/tailscale"

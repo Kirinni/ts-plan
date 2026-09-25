@@ -1,0 +1,58 @@
+#!/bin/sh
+# ts-status —— 看节点状态。会自动确保 CLI 在内存里，用完自动清理。
+#
+#   ts-status                    # 等价于 tailscale status
+#   ts-status --json
+#   ts-status ping 100.64.0.1    # 其它子命令原样透传
+#
+# 之所以需要它：自编译单二进制平时常驻内存、CLI 是软链，直接就能用；
+# 而官方静态包的 CLI 是个独立的 32MB 文件，平时不驻留，这里会自动拉/删。
+#
+# TS_CONF=/path/to/ts.conf   指定别的配置（自测用）
+set -u
+
+CONF="${TS_CONF:-/etc/tailscale/ts.conf}"
+[ -f "$CONF" ] || {
+	echo "!! 找不到 $CONF —— 先跑 install.sh" >&2
+	exit 2
+}
+# shellcheck source=/dev/null
+. "$CONF"
+
+TS_DIR="${TS_DIR:-/tmp/tailscale}"
+SOCKET="${SOCKET:-$TS_DIR/tailscaled.sock}"
+CLI="$TS_DIR/tailscale"
+TS_FETCH="${TS_FETCH:-/usr/sbin/ts-fetch}"
+
+fetched=0
+if [ ! -x "$CLI" ]; then
+	echo ">> 内存里没有 CLI，先拉一个（官方包路径约 14MB，自编译单二进制是软链）"
+	"$TS_FETCH" --with-cli || {
+		echo "!! CLI 准备失败；跑 ts-doctor 看具体哪一项不对" >&2
+		exit 1
+	}
+	fetched=1
+fi
+[ -x "$CLI" ] || {
+	echo "!! 仍然没有 CLI：$CLI" >&2
+	exit 1
+}
+
+[ "$#" -gt 0 ] || set -- status
+
+"$CLI" --socket="$SOCKET" "$@"
+rc=$?
+
+# 默认视图额外补上接口/路由，省得再敲 ip
+if [ "$#" -eq 1 ] && [ "$1" = "status" ]; then
+	ip -4 addr show tailscale0 2>/dev/null | awk '/inet /{print "   tailscale0 : " $2}'
+	ip route 2>/dev/null | awk '/tailscale0/{print "   route      : " $0}' | head -n 5
+fi
+
+# 用后即清：只清"临时拉下来的独立 CLI"，软链不动（软链不占内存）
+if [ "$fetched" = 1 ] && [ -x "$CLI" ] && [ ! -L "$CLI" ]; then
+	rm -f "$CLI" "$TS_DIR/.cli.sha256"
+	echo ">> 已删除临时 CLI，把内存还回去（下次再看得重新拉）"
+fi
+
+exit "$rc"

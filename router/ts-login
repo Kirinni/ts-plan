@@ -12,22 +12,24 @@
 #
 # 失败时保留 CLI，便于你修好问题后直接重跑。
 
-. /etc/tailscale/ts.conf
+. "${TS_CONF:-/etc/tailscale/ts.conf}"
 
 TS_CLI="$TS_DIR/tailscale"
+TS_FETCH="${TS_FETCH:-/usr/sbin/ts-fetch}"
+TS_INITD="${TS_INITD:-/etc/init.d/tailscale-ram}"
 
 echo "==> [1/5] 确保 daemon 在内存中"
-/usr/sbin/ts-fetch || { echo "!! daemon 拉取失败"; exit 1; }
+"$TS_FETCH" || { echo "!! daemon 拉取失败"; exit 1; }
 
 echo "==> [2/5] 临时拉取 CLI"
 if [ -x "$TS_CLI" ]; then
 	echo "   已在内存中，跳过"
 else
-	/usr/sbin/ts-fetch --with-cli || { echo "!! CLI 拉取失败"; exit 1; }
+	"$TS_FETCH" --with-cli || { echo "!! CLI 拉取失败"; exit 1; }
 fi
 
 echo "==> [3/5] 启动服务"
-/etc/init.d/tailscale-ram start
+"$TS_INITD" start
 i=0
 while [ "$i" -lt 60 ]; do
 	[ -S "$SOCKET" ] && break
@@ -60,6 +62,13 @@ elif [ -x "$TS_CLI" ]; then
 	# 官方静态包场景：CLI 是独立的 32MB 真文件，删掉换回内存
 	rm -f "$TS_CLI" "$TS_DIR/.cli.sha256"
 	echo "   已删除独立 CLI，释放约 32MB"
+fi
+
+# authkey 只在"没有 state 时"才用得上。注册成功后 state 已落盘，
+# 留着它只是多一份可在有效期内被别人拿去注册的凭据。
+if [ -s "${AUTHKEY_FILE:-}" ] && [ "${DELETE_AUTHKEY_AFTER_LOGIN:-1}" = "1" ]; then
+	rm -f "$AUTHKEY_FILE"
+	echo "   已删除 $AUTHKEY_FILE（state 已持久化，重启不再需要）"
 fi
 
 echo

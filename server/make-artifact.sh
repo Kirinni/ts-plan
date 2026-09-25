@@ -1,22 +1,28 @@
 #!/usr/bin/env bash
 # 生成给路由器拉取的 Tailscale 工件。
 #
-#   # 默认：官方静态构建（推荐。mipsle 实测为 Soft float + 完全静态，硬件兼容性最好）
+#   # 推荐：打包你自己编译的单二进制（最小、自带 CLI）
+#   #   先在本地跑 server/build-selfbuild.sh 得到 tailscaled_<ver>_mipsle
+#   SOURCE=local BINARY=/root/tailscaled_1.102.4_mipsle OUT=/srv/ts bash make-artifact.sh
+#
+#   # 直接拆官方静态包（不用自己编，但要多一个 CLI 工件、体积翻倍）
 #   SOURCE=official VER=1.102.4 OUT=/srv/ts bash make-artifact.sh
 #
-#   # 可选：从 OpenWrt 的 24.10 分支 ipk 拆包（只有 1.80.3，headscale 可能嫌旧）
+#   # 拆 OpenWrt 24.10 的 ipk（单二进制自带 CLI，但只有 1.80.3）
 #   SOURCE=openwrt OUT=/srv/ts bash make-artifact.sh
 #
-# 产出两个工件（各自 tar.gz + .sha256）：
-#   tailscaled_<ver>_mipsle.tar.gz      只含 daemon —— 开机日常拉这个（约 14MB）
-#   tailscale-cli_<ver>_mipsle.tar.gz   只含 CLI  —— 仅首次注册时拉一次（约 12MB）
+# 产出：每个工件一个 tar.gz + .sha256，另外还会生成
+#   $OUT/ts.conf.local —— 可直接 scp 到路由器 /etc/tailscale/ts.conf.local，
+#   省掉手抄那一长行；也能当 install.sh 的 --artifact 参数用。
 #
-# 为什么拆成两个：官方静态构建的 tailscaled 不含 CLI，两个加起来解压后 70.8MB，
-# 128MB 内存的 R4A 扛不住；而 CLI 只在注册时需要一次，之后 state 持久化在
+# 为什么（官方包）拆成两个：官方静态构建的 tailscaled 不含 CLI，两个加起来解压后
+# 70.8MB，128MB 内存的 R4A 扛不住；而 CLI 只在注册时需要一次，之后 state 持久化在
 # overlay，daemon 自己就能恢复连接，日常只需 38.7MB 的 tailscaled。
 set -euo pipefail
 
-SOURCE="${SOURCE:-official}"        # official | openwrt
+SOURCE="${SOURCE:-official}"         # official | local | openwrt
+                                     # 不给 SOURCE 时走官方静态包（无需其它输入即可跑通）；
+                                     # 自己编了二进制就 SOURCE=local BINARY=...
 VER="${VER:-1.102.4}"                # 官方静态包版本（SOURCE=official 时生效）
 ARCH_GO="${ARCH_GO:-mipsle}"         # Go 架构名：MT7621 是 mipsel(小端/softfloat)
 ARCH_OWRT="${ARCH_OWRT:-mipsel_24kc}"
@@ -26,6 +32,8 @@ BASE_URL="${BASE_URL:-https://dl.example.com/ts/CHANGE_ME_TOKEN}"
 mkdir -p "$OUT"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
+: > "$work/daemon.lines"
+: > "$work/cli.lines"
 
 # 把单个文件压成 tar.gz（-n 不写时间戳，便于重建时结果稳定）
 pack_one() { # $1=源文件  $2=包内文件名  $3=输出路径
@@ -37,10 +45,12 @@ pack_one() { # $1=源文件  $2=包内文件名  $3=输出路径
 	ls -l "$3" | awk -v n="$3" '{printf "   %s  %.1f MB\n", n, $5/1048576}'
 }
 
-emit() { # $1=工件路径  $2=用途说明
-	local f="$1" sha
+emit() { # $1=工件路径  $2=用途说明  $3=daemon|cli
+	local f="$1" sha line
 	sha="$(cat "$f.sha256")"
-	echo "   $sha $BASE_URL/$(basename "$f")    # $2"
+	line="$sha $BASE_URL/$(basename "$f")"
+	printf '%s\n' "$line" >> "$work/$3.lines"
+	echo "   $line    # $2"
 }
 
 # ---------------------------------------------------------------------------
@@ -70,9 +80,9 @@ if [ "$SOURCE" = "official" ]; then
 	pack_one "$d/tailscale"  tailscale  "$OUT/tailscale-cli_${VER}_${ARCH_GO}.tar.gz"
 
 	echo
-	echo "把下面两行分别粘到 router/ts.conf："
-	emit "$OUT/tailscaled_${VER}_${ARCH_GO}.tar.gz"     "TS_ARTIFACTS（开机日常，常驻内存）"
-	emit "$OUT/tailscale-cli_${VER}_${ARCH_GO}.tar.gz"  "TS_CLI_ARTIFACTS（仅 ts-login 首次注册时用）"
+	echo "工件（正式用法见下方生成的 ts.conf.local）："
+	emit "$OUT/tailscaled_${VER}_${ARCH_GO}.tar.gz" "TS_ARTIFACTS（开机日常，常驻内存）" daemon
+	emit "$OUT/tailscale-cli_${VER}_${ARCH_GO}.tar.gz" "TS_CLI_ARTIFACTS（仅 ts-login 首次注册时用）" cli
 
 # ---------------------------------------------------------------------------
 elif [ "$SOURCE" = "openwrt" ]; then
@@ -103,8 +113,8 @@ elif [ "$SOURCE" = "openwrt" ]; then
 	pack_one "$work/x/usr/sbin/tailscaled" tailscaled "$OUT/tailscaled_${ver}_${ARCH_OWRT}.tar.gz"
 
 	echo
-	echo "把下面这行粘到 router/ts.conf 的 TS_ARTIFACTS："
-	emit "$OUT/tailscaled_${ver}_${ARCH_OWRT}.tar.gz" "单二进制，自带 CLI，不需要 TS_CLI_ARTIFACTS"
+	echo "工件（正式用法见下方生成的 ts.conf.local）："
+	emit "$OUT/tailscaled_${ver}_${ARCH_OWRT}.tar.gz" "单二进制，自带 CLI，不需要 TS_CLI_ARTIFACTS" daemon
 
 # ---------------------------------------------------------------------------
 elif [ "$SOURCE" = "local" ]; then
@@ -133,12 +143,51 @@ elif [ "$SOURCE" = "local" ]; then
 	pack_one "$BIN" tailscaled "$OUT/tailscaled_${ver}_${ARCH_GO}.tar.gz"
 
 	echo
-	echo "把下面这行粘到 router/ts.conf 的 TS_ARTIFACTS（TS_CLI_ARTIFACTS 留空）："
-	emit "$OUT/tailscaled_${ver}_${ARCH_GO}.tar.gz" "单二进制自带 CLI，无需 CLI 工件"
+	echo "工件（正式用法见下方生成的 ts.conf.local）："
+	emit "$OUT/tailscaled_${ver}_${ARCH_GO}.tar.gz" "单二进制自带 CLI，无需 CLI 工件" daemon
 else
 	echo "!! SOURCE 只能是 official、openwrt 或 local" >&2
 	exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# 生成可直接 scp 到路由器的配置覆盖文件（省掉手抄那一行长 URL）
+# ---------------------------------------------------------------------------
+CFG="$OUT/ts.conf.local"
+{
+	echo "# 由 make-artifact.sh 生成（$(date '+%F %T')）"
+	echo "# 目标位置：/etc/tailscale/ts.conf.local（ts.conf 会自动 source 它）"
+	echo "# 放在这里而不是改 ts.conf：重跑 install.sh 不会覆盖它。"
+	echo
+	if [ -s "$work/daemon.lines" ]; then
+		echo 'TS_ARTIFACTS="'
+		cat "$work/daemon.lines"
+		echo '"'
+	fi
+	if [ -s "$work/cli.lines" ]; then
+		echo 'TS_CLI_ARTIFACTS="'
+		cat "$work/cli.lines"
+		echo '"'
+	fi
+	echo
+	echo "# 下面两项改成你自己的（留着示例值会被 install.sh / ts-doctor 报警）"
+	echo "LOGIN_SERVER=https://hs.example.com"
+	echo "ADVERTISE_ROUTES=192.168.31.0/24"
+} > "$CFG"
+
 echo
-echo "提示：改版本或重新打包后，务必同步更新 ts.conf 里的 sha256。"
+echo "==================== 给路由器的配置 ===================="
+echo "文件：$CFG"
+echo "两种用法二选一："
+echo "  A) 拷文件：scp $CFG root@192.168.31.1:/etc/tailscale/ts.conf.local"
+echo "  B) 当参数传（不拷文件，装的时候直接写进去）："
+while read -r sha url; do
+	echo "       --artifact \"$sha $url\""
+done < "$work/daemon.lines"
+if [ -s "$work/cli.lines" ]; then
+	while read -r sha url; do
+		echo "       --cli-artifact \"$sha $url\""
+	done < "$work/cli.lines"
+fi
+echo
+echo "提示：换版本/重新打包后 sha256 会变 —— 重跑本脚本重新生成即可。"

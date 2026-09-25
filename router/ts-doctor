@@ -1,0 +1,321 @@
+#!/bin/sh
+# ts-doctor —— 逐项体检。只读，不改动系统。
+#
+#   ts-doctor
+#
+# 覆盖：配置 / 依赖 / 资源 / 网络 / 工件可达性与 sha / 运行态，最后给结论。
+# 退出码：0 = 无 FAIL（可能带 warn）；1 = 有 FAIL；2 = 配置都找不到。
+#
+# TS_CONF=/path/to/ts.conf   指定别的配置（自测用）
+set -uf
+
+CONF="${TS_CONF:-/etc/tailscale/ts.conf}"
+FAIL=0
+WARN=0
+
+ok() { echo "  [ ok ] $*"; }
+bad() {
+	echo "  [FAIL] $*"
+	FAIL=$((FAIL + 1))
+}
+warn() {
+	echo "  [warn] $*"
+	WARN=$((WARN + 1))
+}
+note() { echo "         $*"; }
+sec() {
+	echo
+	echo "== $* =="
+}
+
+[ -f "$CONF" ] || {
+	echo "!! 找不到配置文件 $CONF —— 先在路由器上跑 install.sh" >&2
+	exit 2
+}
+# shellcheck source=/dev/null
+. "$CONF"
+
+TS_DIR="${TS_DIR:-/tmp/tailscale}"
+STATE_DIR="${STATE_DIR:-/etc/tailscale}"
+SOCKET="${SOCKET:-$TS_DIR/tailscaled.sock}"
+AUTHKEY_FILE="${AUTHKEY_FILE:-$STATE_DIR/authkey}"
+TS_CLI="$TS_DIR/tailscale"
+
+echo "ts-doctor —— 配置：$CONF"
+
+# --------------------------------------------------------------------------
+sec "配置"
+n_art=0
+for w in ${TS_ARTIFACTS:-}; do n_art=$((n_art + 1)); done
+n_art=$((n_art / 2))
+
+case "${TS_ARTIFACTS:-}" in
+	"")
+		bad "TS_ARTIFACTS 为空 —— 开机拉取一定失败"
+		note "补：sh install.sh --artifact \"<sha256> <url>\""
+		;;
+	*PUT_SHA256_HERE*)
+		bad "TS_ARTIFACTS 还是占位符 PUT_SHA256_HERE"
+		;;
+	*)
+		ok "TS_ARTIFACTS 有 $n_art 个条目（按顺序回退）"
+		;;
+esac
+
+set -- ${TS_ARTIFACTS:-}
+while [ "$#" -ge 2 ]; do
+	sha="$1"
+	url="$2"
+	shift 2
+	case "$sha" in
+		*[!0-9a-f]* | "") bad "sha256 含非十六进制字符：$sha" ;;
+		*)
+			if [ "${#sha}" -eq 64 ]; then
+				ok "sha256 格式正确（$(printf '%.8s' "$sha")…）"
+			else
+				bad "sha256 长度应为 64，实际 ${#sha}"
+			fi
+			;;
+	esac
+	case "$url" in
+		http://* | https://* | file://*) ;;
+		*) bad "URL 前缀不对：$url" ;;
+	esac
+done
+
+case "${LOGIN_SERVER:-}" in
+	"") bad "LOGIN_SERVER 为空" ;;
+	*example.com*) warn "LOGIN_SERVER 还是示例值（$LOGIN_SERVER）" ;;
+	*) ok "LOGIN_SERVER = $LOGIN_SERVER" ;;
+esac
+
+if [ -n "${ADVERTISE_ROUTES:-}" ]; then
+	ok "ADVERTISE_ROUTES = $ADVERTISE_ROUTES"
+else
+	warn "ADVERTISE_ROUTES 为空：家里其它设备访问不到内网"
+fi
+
+if [ -f "${CONF_LOCAL:-$CONF.local}" ]; then
+	ok "存在本地覆盖 ${CONF_LOCAL:-$CONF.local}"
+else
+	note "没有 ${CONF_LOCAL:-$CONF.local}（配置全在 ts.conf 里，重装时容易被覆盖）"
+fi
+
+if [ -n "${TS_CLI_ARTIFACTS:-}" ]; then
+	ok "TS_CLI_ARTIFACTS 已配置（官方静态包路径）"
+else
+	ok "TS_CLI_ARTIFACTS 为空（自编译单二进制 / OpenWrt ipk 自带 CLI，正常）"
+fi
+
+# --------------------------------------------------------------------------
+sec "依赖"
+if command -v curl >/dev/null 2>&1; then
+	ok "curl 可用"
+elif command -v uclient-fetch >/dev/null 2>&1; then
+	ok "curl 没有，但有 uclient-fetch"
+elif command -v wget >/dev/null 2>&1; then
+	warn "只有 busybox wget：HTTPS 支持取决于固件是否带 libustream-ssl"
+else
+	bad "curl / uclient-fetch / wget 一个都没有"
+fi
+
+if [ -c /dev/net/tun ]; then
+	ok "/dev/net/tun 存在"
+else
+	bad "/dev/net/tun 不存在（mknod /dev/net/tun c 10 200）"
+fi
+
+if lsmod 2>/dev/null | grep -q '^tun'; then
+	ok "tun 模块已加载"
+else
+	warn "tun 模块当前没加载（首次启动通常会自动加载，若 daemon 起不来再查）"
+fi
+
+ca_found=0
+for f in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /etc/ssl/certs; do
+	if [ -e "$f" ]; then
+		ok "CA 证书：$f"
+		ca_found=1
+		break
+	fi
+done
+[ "$ca_found" = 1 ] || bad "找不到 CA 证书（opkg install ca-bundle），HTTPS 拉取会失败"
+
+for c in sha256sum tar gzip awk; do
+	command -v "$c" >/dev/null 2>&1 || bad "缺少 $c"
+done
+
+# --------------------------------------------------------------------------
+sec "资源"
+mem_kb="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)"
+if [ -n "${mem_kb:-}" ]; then
+	mem_mb="$(awk -v k="$mem_kb" 'BEGIN{printf "%.0f", k/1024}')"
+	ok "可用内存 ${mem_mb}MB"
+	[ "$mem_mb" -lt 60 ] && warn "可用内存偏低；自编译单二进制约需 30MB，官方包首装约需 85MB"
+else
+	warn "读不到 /proc/meminfo"
+fi
+
+tmp_free_mb="$(df -k /tmp 2>/dev/null | awk 'NR==2{printf "%d", $4/1024}')"
+if [ -n "${tmp_free_mb:-}" ]; then
+	ok "/tmp 可用 ${tmp_free_mb}MB（TMPFS_SIZE=${TMPFS_SIZE:-未设}）"
+	[ "$tmp_free_mb" -lt 40 ] && warn "/tmp 剩余偏小：试试 mount -o remount,size=${TMPFS_SIZE:-96m} /tmp"
+else
+	warn "拿不到 /tmp 的可用空间"
+fi
+
+tgz="$(ls "$TS_DIR"/*.tar.gz 2>/dev/null | head -n1)"
+if [ -n "${tgz:-}" ]; then
+	raw="$(gzip -l "$tgz" 2>/dev/null | awk 'NR==2{print $2}')"
+	[ -n "${raw:-}" ] && ok "本地已有 $(basename "$tgz")：解压后约 $(awk -v b="$raw" 'BEGIN{printf "%.1f", b/1048576}')MB"
+else
+	note "内存里还没有 tar.gz（正常：解包后即删；或首次拉取还没跑完）"
+fi
+
+# --------------------------------------------------------------------------
+sec "网络"
+if ip route show default 2>/dev/null | grep -q . ; then
+	ok "默认路由存在"
+else
+	bad "没有默认路由（WAN 没起来？）"
+fi
+
+host="$(printf '%s' "${LOGIN_SERVER:-}" | sed -e 's|^https\{0,1\}://||' -e 's|/.*$||' -e 's|:.*$||')"
+if [ -n "$host" ]; then
+	if nslookup "$host" >/dev/null 2>&1; then
+		ok "能解析 $host"
+	else
+		bad "解析不了 $host（DNS 问题？）"
+	fi
+fi
+
+# --------------------------------------------------------------------------
+sec "工件"
+url_ok() { # 0=可达 1=不可达 2=没有工具
+	case "$1" in
+		file://*)
+			[ -f "${1#file://}" ] && return 0 || return 1
+			;;
+	esac
+	if command -v curl >/dev/null 2>&1; then
+		c="$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 20 -I "$1" 2>/dev/null)" || c=""
+		if [ -z "$c" ]; then
+			c="$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 20 -r 0-0 "$1" 2>/dev/null)" || c=""
+		fi
+		[ -n "$c" ] && [ "$c" != "000" ] && return 0
+		return 1
+	fi
+	if command -v uclient-fetch >/dev/null 2>&1; then
+		uclient-fetch -q -O /dev/null --timeout 20 "$1" >/dev/null 2>&1 && return 0
+		return 1
+	fi
+	if command -v wget >/dev/null 2>&1; then
+		wget -q -O /dev/null --timeout 20 "$1" >/dev/null 2>&1 && return 0
+		return 1
+	fi
+	return 2
+}
+
+i=0
+set -- ${TS_ARTIFACTS:-}
+while [ "$#" -ge 2 ]; do
+	sha="$1"
+	url="$2"
+	shift 2
+	i=$((i + 1))
+	case "$url" in
+		file://* | http://* | https://*) ;;
+		*) continue ;;
+	esac
+	url_ok "$url"
+	case "$?" in
+		0) ok "工件 $i 可达：$(printf '%s' "$url" | sed 's|/[^/]*$||')/…" ;;
+		1) bad "工件 $i 不可达：$url" ;;
+		2) warn "没有下载工具，跳过可达性检查" ;;
+	esac
+	# 若本地正好有同名包，顺手核对 sha
+	bn="$(basename "$url")"
+	if [ -f "$TS_DIR/$bn" ]; then
+		got="$(sha256sum "$TS_DIR/$bn" 2>/dev/null | cut -d' ' -f1)"
+		if [ "$got" = "$sha" ]; then
+			ok "本地 $bn 的 sha256 与配置一致"
+		else
+			bad "本地 $bn 的 sha256 不匹配（配置 $sha / 实际 $got）"
+		fi
+	fi
+done
+[ "$i" = 0 ] && bad "没有可检查的工件条目"
+
+# --------------------------------------------------------------------------
+sec "运行态"
+if [ -f /tmp/.ts-fetch-running ]; then
+	warn "ts-fetch 正在拉取中（/tmp/.ts-fetch-running 存在）——稍后再看"
+fi
+
+if [ -x "$TS_DIR/tailscaled" ]; then
+	ok "二进制在内存里：$TS_DIR/tailscaled"
+	# 注意：不能用 if v="$(cmd | head -n1)"; then —— 赋值永远成功，判断恒为真。
+	#       必须落到文件再取退出码。
+	VEROUT="$(mktemp)"
+	"$TS_DIR/tailscaled" --version > "$VEROUT" 2>&1
+	ver_rc=$?
+	v="$(head -n1 "$VEROUT")"
+	rm -f "$VEROUT"
+	if [ "$ver_rc" -eq 0 ]; then
+		ok "自检通过：$v"
+	else
+		bad "tailscaled --version 失败（rc=$ver_rc，架构/软浮点不对？）：$v"
+	fi
+else
+	warn "内存里还没有二进制（重启后首次拉取未完成，或拉取失败）"
+fi
+
+if [ -L "$TS_CLI" ]; then
+	ok "CLI 软链存在：$TS_CLI -> $(readlink "$TS_CLI")"
+elif [ -x "$TS_CLI" ]; then
+	warn "CLI 是独立文件（官方包路径）：ts-status 用完会自动删掉它省内存"
+fi
+
+if ps 2>/dev/null | grep -v grep | grep -q tailscaled; then
+	ok "tailscaled 进程在跑"
+else
+	bad "没有 tailscaled 进程（/etc/init.d/tailscale-ram start）"
+fi
+
+if [ -S "$SOCKET" ]; then
+	ok "socket 存在：$SOCKET"
+else
+	warn "socket 不存在：$SOCKET（daemon 没起来？）"
+fi
+
+if [ -f "$STATE_DIR/tailscaled.state" ]; then
+	ok "state 存在（节点身份持久化，重启不用重新注册）"
+	if [ -s "$AUTHKEY_FILE" ]; then
+		warn "state 已存在但 $AUTHKEY_FILE 还在 —— 注册完成后可以删掉它：rm -f $AUTHKEY_FILE"
+	fi
+else
+	warn "还没有 state：尚未注册，注册前需要 authkey（ts-login）"
+	if [ ! -s "$AUTHKEY_FILE" ]; then
+		bad "$AUTHKEY_FILE 不存在或为空，注册会失败"
+	fi
+fi
+
+if ip -4 addr show tailscale0 2>/dev/null | grep -q inet; then
+	ok "tailscale0 有 IPv4 地址"
+else
+	warn "tailscale0 还没地址（未注册 / 未连接）"
+fi
+
+# --------------------------------------------------------------------------
+echo
+if [ "$FAIL" -gt 0 ]; then
+	echo "== 结论：$FAIL 项失败，$WARN 项警告 =="
+	echo "   日志：tail -n 30 /tmp/ts-fetch.log；tail -n 30 /tmp/ts-up.log"
+	exit 1
+fi
+if [ "$WARN" -gt 0 ]; then
+	echo "== 结论：通过（$WARN 项警告）=="
+	exit 0
+fi
+echo "== 结论：全部通过 =="
+exit 0
