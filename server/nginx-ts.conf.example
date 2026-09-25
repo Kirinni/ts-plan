@@ -1,0 +1,40 @@
+# /etc/nginx/conf.d/ts-download.conf
+#
+# 复用 443 端口分发 Tailscale 工件：
+#   - 用独立子域名（推荐），或直接挂在 headscale 同域名的子路径下
+#   - 路径里带随机 token，配合 autoindex off
+#   - HTTPS + ca-bundle 让路由器用 curl 直接拉
+#
+# 证书：建议复用已有的证书（如 certbot 签发的 dl.example.com）
+#
+# 如果没有 nginx，可临时用：
+#   python3 -m http.server 8090 --directory /srv/ts
+
+server {
+    # nginx >= 1.25.1 用下面这种写法（本文件默认）；
+    # 老版本改成： listen 443 ssl http2;  并删掉 http2 on;
+    listen      443 ssl;
+    listen      [::]:443 ssl;
+    http2       on;
+
+    server_name dl.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/dl.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/dl.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    # ---- 工件分发：把 PASTE_RANDOM_TOKEN 换成 openssl rand -hex 16 的结果 ----
+    location ^~ /ts/PASTE_RANDOM_TOKEN/ {
+        alias /srv/ts/;
+        autoindex off;
+        add_header Cache-Control "no-store";
+        limit_rate 16m;              # 可选：限速，避免抢占你的小带宽
+        limit_rate_after 1m;
+        access_log /var/log/nginx/ts-download.log;
+    }
+
+    # 其它路径一律不响应，避免暴露文件列表
+    location / {
+        return 404;
+    }
+}

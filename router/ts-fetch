@@ -1,0 +1,212 @@
+#!/bin/sh
+# 把 Tailscale 拉进内存运行：下载 -> sha256 校验 -> 解包 -> 自检
+#
+#   ts-fetch               只确保 daemon（tailscaled）可用 —— 开机路径走这个
+#   ts-fetch --with-cli    额外拉取 CLI —— 首次注册 / 重新注册时需要
+#
+# 退出码 0 表示对应二进制已就绪。
+#
+# 【为什么 CLI 是可选的】
+# 实测官方静态构建的 tailscaled **不含 CLI 多调用**：把它以 tailscale 之名
+# 调用会报 "tailscaled does not take non-flag arguments: [\"version\"]"。
+# 而 CLI 只在注册时需要一次 —— state（含 prefs）持久化到 STATE_DIR 之后，
+# daemon 启动会自行恢复连接。所以日常常驻内存的只有 tailscaled 一个，
+# 比"两个都常驻"（解压后 70.8MB）省下一半以上。
+
+. /etc/tailscale/ts.conf
+
+log()  { logger -t ts-fetch "$*"; echo "[ts-fetch] $*"; }
+warn() { log "WARN: $*"; }
+
+host_of() {
+	echo "$1" | sed -e 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##' -e 's#/.*$##' -e 's#:[0-9]*$##'
+}
+
+# 优先用 curl（自带超时/重试），退化到 busybox wget
+download() { # $1=url $2=dest
+	if command -v curl >/dev/null 2>&1; then
+		curl -fL --connect-timeout 10 --max-time 900 --retry 2 --retry-delay 5 -o "$2" "$1"
+	else
+		wget -T 60 -O "$2" "$1"
+	fi
+}
+
+# ---------- 自检（都不需要 daemon 在跑，纯本地命令） ----------
+daemon_ok() {
+	[ -x "$TS_DIR/tailscaled" ] || return 1
+	"$TS_DIR/tailscaled" --version >/dev/null 2>&1
+}
+
+cli_ok() {
+	[ -x "$TS_DIR/tailscale" ] || return 1
+	"$TS_DIR/tailscale" version >/dev/null 2>&1
+}
+
+stamp_ok() { # $1=stamp 名  $2=sha256
+	[ -r "$TS_DIR/$1" ] || return 1
+	[ "$(cat "$TS_DIR/$1" 2>/dev/null)" = "$2" ]
+}
+
+wait_network() {
+	first_url="$(printf '%s\n%s\n' "$TS_ARTIFACTS" "${TS_CLI_ARTIFACTS:-}" \
+		| awk 'NF >= 2 && $1 !~ /^#/ { print $2; exit }')"
+	[ -n "$first_url" ] || return 0
+	h="$(host_of "$first_url")"
+	i=0
+	while [ "$i" -lt 36 ]; do
+		if ip route show default 2>/dev/null | grep -q '^default' \
+		   && nslookup "$h" >/dev/null 2>&1; then
+			log "网络就绪（$h 可解析）"
+			return 0
+		fi
+		sleep 5
+		i=$((i + 1))
+	done
+	warn "等待网络超时（3 分钟），继续尝试下载"
+	return 1
+}
+
+install_daemon() { # $1=tar.gz  $2=sha256
+	tgz="$1"
+	sha="$2"
+
+	# 清掉上一份二进制（点文件不在 glob 范围内，会保留）
+	for f in "$TS_DIR"/*; do
+		[ -e "$f" ] && rm -rf "$f"
+	done
+	rm -f "$TS_DIR/.installed.sha256" "$TS_DIR/.cli.sha256"
+
+	tar xzf "$tgz" -C "$TS_DIR" || { warn "解包失败"; return 1; }
+
+	bin="$(find "$TS_DIR" -type f -name tailscaled | head -n1)"
+	[ -n "$bin" ] || { warn "包里没找到 tailscaled"; return 1; }
+	[ "$bin" = "$TS_DIR/tailscaled" ] || { mv -f "$bin" "$TS_DIR/tailscaled" || return 1; }
+	chmod 0755 "$TS_DIR/tailscaled" 2>/dev/null
+
+	# 包里自带 tailscale（自制合并包 / OpenWrt 单二进制）就保留
+	cli="$(find "$TS_DIR" -type f -name tailscale | head -n1)"
+	if [ -n "$cli" ] && [ "$cli" != "$TS_DIR/tailscale" ]; then
+		mv -f "$cli" "$TS_DIR/tailscale" || return 1
+		chmod 0755 "$TS_DIR/tailscale" 2>/dev/null
+	elif [ -z "$cli" ]; then
+		# 试探这个 tailscaled 是否支持以 tailscale 之名调用出 CLI
+		ln -sf tailscaled "$TS_DIR/tailscale"
+		if cli_ok; then
+			log "该构建自带 CLI（单二进制多调用）"
+		else
+			rm -f "$TS_DIR/tailscale"
+			log "该构建不含 CLI（官方静态包即如此）；注册时执行 ts-fetch --with-cli"
+		fi
+	fi
+
+	find "$TS_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null
+
+	rm -f "$tgz"
+	echo "$sha" > "$TS_DIR/.installed.sha256"
+	return 0
+}
+
+install_cli() { # $1=tar.gz  $2=sha256
+	tgz="$1"
+	sha="$2"
+	tmp="$TS_DIR/.cli.tmp"
+
+	rm -rf "$tmp" && mkdir -p "$tmp"
+	tar xzf "$tgz" -C "$tmp" || { warn "CLI 解包失败"; rm -rf "$tmp"; return 1; }
+
+	bin="$(find "$tmp" -type f -name tailscale | head -n1)"
+	[ -n "$bin" ] || { warn "CLI 包里没找到 tailscale"; rm -rf "$tmp"; return 1; }
+
+	rm -f "$TS_DIR/tailscale"
+	# 同一 tmpfs 内的 mv 是 rename，不会额外占用内存
+	mv -f "$bin" "$TS_DIR/tailscale" || { rm -rf "$tmp"; return 1; }
+	rm -rf "$tmp"
+	chmod 0755 "$TS_DIR/tailscale" 2>/dev/null
+
+	rm -f "$tgz"
+	echo "$sha" > "$TS_DIR/.cli.sha256"
+	return 0
+}
+
+# 通用阶段：按列表顺序带重试地获取，直到 validator 通过
+fetch_stage() { # $1=工件列表 $2=安装函数 $3=校验函数 $4=stamp 名 $5=标签
+	list="$1"; installer="$2"; validator="$3"; stamp="$4"; label="$5"
+
+	if [ -z "$(printf '%s' "$list" | tr -d '[:space:]')" ]; then
+		warn "$label 的工件列表为空"
+		return 1
+	fi
+
+	attempt=1
+	while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+		while read -r sha url; do
+			case "$sha" in ''|\#*) continue ;; esac
+			[ -n "$url" ] || continue
+
+			if stamp_ok "$stamp" "$sha" && $validator; then
+				log "$label 已在内存中且自检通过，跳过下载"
+				return 0
+			fi
+
+			log "$label 尝试[$attempt] $url"
+			rm -f "$TS_DIR/.artifact.tgz"
+
+			if ! download "$url" "$TS_DIR/.artifact.tgz"; then
+				warn "下载失败"
+				continue
+			fi
+
+			got="$(sha256sum "$TS_DIR/.artifact.tgz" | cut -d' ' -f1)"
+			if [ "$got" != "$sha" ]; then
+				warn "sha256 不匹配（期望 $sha / 实得 $got），丢弃"
+				continue
+			fi
+
+			if $installer "$TS_DIR/.artifact.tgz" "$sha" && $validator; then
+				log "$label 就绪"
+				return 0
+			fi
+			warn "$label 解包或自检未通过，回退到下一个工件"
+		done <<EOF
+$list
+EOF
+		attempt=$((attempt + 1))
+		[ "$attempt" -le "$MAX_ATTEMPTS" ] && sleep "$RETRY_DELAY"
+	done
+
+	warn "$label 全部工件与 $MAX_ATTEMPTS 轮重试均失败"
+	return 1
+}
+
+main() {
+	with_cli=0
+	for a in "$@"; do
+		[ "$a" = "--with-cli" ] && with_cli=1
+	done
+
+	if [ -z "${TS_DIR:-}" ] || [ -z "${LOGIN_SERVER:-}" ]; then
+		log "ts.conf 未正确配置"
+		return 1
+	fi
+
+	mkdir -p "$TS_DIR" "$STATE_DIR"
+	chmod 0700 "$STATE_DIR" 2>/dev/null
+
+	# 只抬高 tmpfs 上限，不会预分配内存
+	[ -n "${TMPFS_SIZE:-}" ] && mount -o remount,size="$TMPFS_SIZE" /tmp >/dev/null 2>&1
+
+	wait_network
+
+	fetch_stage "$TS_ARTIFACTS" install_daemon daemon_ok .installed.sha256 daemon || return 1
+
+	if [ "$with_cli" = "1" ]; then
+		fetch_stage "${TS_CLI_ARTIFACTS:-}" install_cli cli_ok .cli.sha256 CLI || return 1
+	else
+		cli_ok && log "内存中已有 CLI（日常不需要，注册时才有用）"
+	fi
+
+	log "完成：$("$TS_DIR/tailscaled" --version 2>&1 | head -n1)"
+	return 0
+}
+
+main "$@"

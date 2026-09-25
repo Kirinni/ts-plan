@@ -1,0 +1,70 @@
+#!/bin/sh
+# 首次注册（或 state 丢失后重新注册）到 headscale。
+#
+#   ts-login
+#
+# 做的事：
+#   1. 把 daemon 拉进内存
+#   2. 临时把 CLI 也拉进来（官方静态构建的 tailscaled 不含 CLI，注册必须成对）
+#   3. 启动服务、等 socket 就绪
+#   4. tailscale up --login-server=... --authkey=... --advertise-routes=...
+#   5. 成功后删掉 CLI 释放内存（约 32MB），之后每次开机只拉 daemon
+#
+# 失败时保留 CLI，便于你修好问题后直接重跑。
+
+. /etc/tailscale/ts.conf
+
+TS_CLI="$TS_DIR/tailscale"
+
+echo "==> [1/5] 确保 daemon 在内存中"
+/usr/sbin/ts-fetch || { echo "!! daemon 拉取失败"; exit 1; }
+
+echo "==> [2/5] 临时拉取 CLI"
+if [ -x "$TS_CLI" ]; then
+	echo "   已在内存中，跳过"
+else
+	/usr/sbin/ts-fetch --with-cli || { echo "!! CLI 拉取失败"; exit 1; }
+fi
+
+echo "==> [3/5] 启动服务"
+/etc/init.d/tailscale-ram start
+i=0
+while [ "$i" -lt 60 ]; do
+	[ -S "$SOCKET" ] && break
+	sleep 2
+	i=$((i + 1))
+done
+if [ ! -S "$SOCKET" ]; then
+	echo "!! socket 未就绪（$SOCKET），请查看 /tmp/ts-up.log"
+	exit 1
+fi
+
+echo "==> [4/5] 注册到 $LOGIN_SERVER"
+set -- --login-server="$LOGIN_SERVER" --hostname="$HOSTNAME_OVERRIDE"
+[ -n "$ADVERTISE_ROUTES" ] && set -- "$@" --advertise-routes="$ADVERTISE_ROUTES"
+[ -s "$AUTHKEY_FILE" ] && set -- "$@" --authkey="$(cat "$AUTHKEY_FILE")"
+for e in $UP_EXTRA; do set -- "$@" "$e"; done
+
+"$TS_CLI" --socket="$SOCKET" up "$@"
+rc=$?
+if [ "$rc" != "0" ]; then
+	echo "!! tailscale up 失败（rc=$rc）；CLI 已保留，修好后重跑 ts-login"
+	exit "$rc"
+fi
+
+echo "==> [5/5] 注册成功，处理 CLI"
+if [ -L "$TS_CLI" ]; then
+	# 自编译单二进制场景：CLI 只是指向 tailscaled 的软链，删了不省内存，留着更好用
+	echo "   单二进制自带 CLI（软链），保留"
+elif [ -x "$TS_CLI" ]; then
+	# 官方静态包场景：CLI 是独立的 32MB 真文件，删掉换回内存
+	rm -f "$TS_CLI" "$TS_DIR/.cli.sha256"
+	echo "   已删除独立 CLI，释放约 32MB"
+fi
+
+echo
+echo "完成。接下来在服务器上批准路由："
+echo "  headscale routes list"
+echo "  headscale routes enable -r <route-id>"
+echo
+echo "需要看状态时：ts-fetch --with-cli && $TS_CLI --socket=$SOCKET status（看完 rm 掉即可）"
