@@ -65,6 +65,7 @@ flowchart LR
 | `router/ts-doctor` | 逐项体检：配置 / 依赖 / 资源 / 网络 / 工件可达性 / 运行态 |
 | `router/ts-status` | 看节点状态；CLI 不在内存就自动拉，用完自动删 |
 | `router/tailscale-ram` | procd 服务：开机拉取、守护 daemon、按需 `tailscale up` |
+| `OPS.md` | **运维指南**：新机接入 / 升级维护 / 巡检备份 / 卸载清理 / 故障速查 |
 
 ---
 
