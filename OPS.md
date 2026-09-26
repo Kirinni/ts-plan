@@ -184,6 +184,51 @@ sudo tar -czf /root/nginx-ts-$(date +%F).tgz /etc/nginx/conf.d /etc/nginx/ssl
 - 留住每台的安装命令就能快速回退（只换 `--ref/--sha256/--artifact` 三个值）
 - 换工件后路由器 sha 必须同步，对不上 `ts-doctor` 会直接报
 
+### 2.8 升级 headscale 本身（VPS 控制面）
+
+> 与 ts-plan 的发版完全独立；只影响控制面，重启期间节点掉几秒后自动连回，**不需要重新注册**。
+
+**升级前必须做的两件事**
+
+1. **备份**（0.29 起**禁止降级**，回滚只能靠恢复 DB）：
+   ```sh
+   sudo systemctl stop headscale
+   sudo tar -czf /root/headscale-pre-<新版本>-$(date +%F).tgz /etc/headscale /var/lib/headscale
+   sudo cp /usr/bin/headscale /root/headscale-<旧版本>.bin
+   sudo systemctl start headscale
+   ```
+2. **看 release notes 的 BREAKING 段**：重点看「配置键重命名/删除」和「最低客户端版本」。
+
+**装包（务必加 `--force-confold`）**
+
+```sh
+sudo dpkg -i --force-confold ~/headscale_<新版本>_linux_amd64.deb
+sudo systemctl restart headscale
+sudo journalctl -u headscale -n 25 --no-pager
+```
+
+- `--force-confold` = 永远保留你现有的 `config.yaml`。**不加它，dpkg 可能用新版默认配置覆盖你的 config**，症状是只监听 `127.0.0.1:8080`、内嵌 DERP / STUN 全消失、所有节点掉线
+- 真被覆盖了也别慌：dpkg 会留下 `/etc/headscale/config.yaml.dpkg-old`（替换前那份），自己备份的通常是 `config.yaml.bak`
+
+**验收**
+
+```sh
+headscale version                     # 新版本
+sudo headscale nodes list             # 节点都在、online
+sudo headscale routes list            # 路由仍 enabled
+# 日志里应有：listening and serving HTTP on: 0.0.0.0:<你的端口> / stun server started / derp region: ...
+```
+
+**已知升级陷阱（本项目实际踩过）**
+
+| 版本 | 陷阱 |
+|---|---|
+| 0.29 | 删除 `randomize_client_port` 配置键：**存在即拒绝启动**（默认行为就是 false，直接删该行） |
+| 0.29 | `ephemeral_node_inactivity_timeout` 移到 `node.ephemeral.inactivity_timeout`（旧键被忽略并告警） |
+| 0.29 | 强制单向升级：不允许跨 minor 跳（0.27→0.29 要分两步）、**不允许降级** |
+| 0.29 | 最低客户端版本 v1.80，过老的客户端会被拒 |
+| 0.28 | `preauthkeys create --user` 只收数字 ID（见 §5） |
+
 ## 3. 卸载与清理
 
 ### 3.1 单台路由器临时下线
@@ -254,3 +299,5 @@ sudo tar -czf /root/headscale-final-$(date +%F).tgz /etc/headscale /var/lib/head
 - **token 不是密钥**：它是"挡爬虫"的随机路径，公开仓库的 run 日志里会带上，当作公开地址看待
 - **Windows + plink/pscp**：PowerShell 5.1 会吞掉参数里内嵌的双引号（远端 `grep "a|b"` 会变成真管道）——远端命令尽量别用双引号
 - **R4A 只有 16MB flash**：二进制永远只放 `/tmp`；`/etc/tailscale` 只放几十 KB 的 state
+- **dpkg 升级 headscale 会覆盖 `config.yaml`**（conffile 交互里选了/等效于"安装维护者版本"）：一律用 `sudo dpkg -i --force-confold <deb>`。症状是只监听 `127.0.0.1:8080`、DERP/STUN 消失、节点全掉线；恢复用 `config.yaml.dpkg-old`（或自己的 `config.yaml.bak`）覆盖回去再重启
+- **headscale 0.29 起禁止降级**：升级前必须 tar 备份 `/etc/headscale` + `/var/lib/headscale`；回滚 = 恢复 DB + 换回旧二进制（直接降级会被拒绝启动）
