@@ -22,6 +22,8 @@ tailscaled_*_mipsle*
 .cli*.sh
 .selftest*
 *.log
+# 临时提交信息文件（git commit -F 用，省得被 PowerShell 的引号处理搞坏）
+.commitmsg*
 
 # 编辑器 / 系统垃圾
 .DS_Store

@@ -44,6 +44,9 @@ flowchart LR
 
 ## 二、目录
 
+> **第一次部署请直接看「三、从零部署（照着走一遍）」**：那份是按时间顺序的操作手册，
+> 下面的章节是按组件组织的参考细节。
+
 | 路径 | 用途 |
 |---|---|
 | `server/build-selfbuild.sh` | 本地：交叉编译单二进制，断言 CLI 行为 + 软浮点 + 静态（没 Go 会自己装） |
@@ -62,9 +65,200 @@ flowchart LR
 
 ---
 
-# 三、服务器（广州 VPS）
+# 三、从零部署（照着走一遍）
+
+> 涉及三台机器：**你的电脑**（编译）→ **VPS**（分发 + headscale）→ **路由器**（运行）。
+> 每步末尾有**检查点**，过不了就别往下走。出错先看「七、排错」。
+> 全程只有第 3、4、6 步需要替换成你自己的值（域名 / token / 网段）。
+
+## 0. 前提
+
+| 需要 | 怎么确认 |
+|---|---|
+| 路由器已刷 OpenWrt，能上网 | `opkg update` 能通 |
+| 一台能访问 GitHub 的 VPS | 只有"取源码 / 取官方包"这一步用得到，**路由器不需要访问 GitHub** |
+| headscale 已在 VPS 跑起来 | `headscale version` 有输出 |
+| 一个域名 + 证书 | 用于 HTTPS 分发工件；可以复用 headscale 的域名，换个路径 |
+| 本机有 Go ≥ 1.26（可选） | 没有也行：`build-selfbuild.sh` 会自己下一个临时的 |
+
+## 1. 编一个单二进制（你的电脑上）
+
+```sh
+bash server/build-selfbuild.sh            # 默认 VER=1.102.4
+```
+
+**检查点**：出现这三行，并且产物在 `out/`
+
+```
+   OK 单文件自带 CLI：1.102.4
+   OK Soft float + 静态链接（readelf）
+体积   : raw 30.5 MB | gzip 9.9 MB（≈ 每次开机下载量）
+```
+
+> 为什么自己编：单文件 30.5MB、自带 CLI、gzip 后 9.9MB；官方静态包要两个文件共 70.8MB。
+> 详见「一、先看实测结论」。
+
+## 2. 传到 VPS
+
+```sh
+scp out/tailscaled_1.102.4_mipsle root@<你的VPS>:/root/
+```
+
+## 3. 在 VPS 上打包，并生成路由器配置
+
+> 下面默认你在 VPS 上就是 **root**（自己的机器常见如此）。用普通用户时，注意
+> 别让 `sudo` 去跑需要 git 的命令（root 打开属于你的仓库会报 *dubious ownership*）。
+
+```sh
+# 在 VPS 上（本仓库的一份 clone 里）
+mkdir -p /srv/ts
+SOURCE=local BINARY=/root/tailscaled_1.102.4_mipsle \
+     OUT=/srv/ts BASE_URL=https://dl.example.com/ts/<你的token> \
+     bash server/make-artifact.sh
+```
+
+这一步会做三件事：校验软浮点/静态 → 打成 `tar.gz` + sha256 → **生成 `/srv/ts/ts.conf.local`**（省得你手抄那行长 URL）。
+
+**检查点**：输出里有 `==================== 给路由器的配置 ====================`，并打印出 `--artifact "<sha> <url>"` 那一行 —— **把这段复制下来，第 6 步要用**。
+
+## 4. 让 VPS 通过 HTTPS 分发（顺便把仓库快照也放上）
+
+```sh
+cp server/nginx-ts.conf.example /etc/nginx/conf.d/ts-download.conf
+openssl rand -hex 16                    # 生成随机路径 token，填进配置
+nginx -t && systemctl reload nginx
+
+# 顺手导出仓库快照，让路由器安装时也不用碰 GitHub
+OUT=/srv/ts BASE_URL=https://dl.example.com/ts/<token> \
+  bash server/make-repo-archive.sh
+```
+
+**检查点**：
+
+```sh
+curl -I https://dl.example.com/ts/<token>/tailscaled_1.102.4_mipsle.tar.gz   # 200
+curl -I https://dl.example.com/ts/<token>/bootstrap.sh                       # 200
+```
+
+`make-repo-archive.sh` 会把它算出的**快照 sha256** 和第 6 步要用的完整命令一起打出来。
+
+> 只想最省事、不介意路由器安装时访问 GitHub？第 4 步的后半段可以跳过 —— 安装那一次从 GitHub 取脚本即可，**开机路径仍然只访问你的 VPS**。
+
+## 5. 建用户、发 preauthkey（VPS 上）
+
+```sh
+bash server/headscale-bootstrap.sh --user home --routes 192.168.31.0/24
+```
+
+**检查点**：打印出 `tskey-auth-…` 和一段 `autoApprovers` 配置片段。
+headscale 跑在容器里时加前缀：`HEADSCALE_CMD="docker exec headscale headscale" bash server/headscale-bootstrap.sh …`
+
+## 6. 路由器上安装（一条命令）
+
+```sh
+# 推荐：从自己的服务器装（全程不碰 GitHub）
+wget -O- https://dl.example.com/ts/<token>/bootstrap.sh | sh -s -- \
+  --base-url https://dl.example.com/ts/<token> \
+  --ref <第 4 步的 commit> --sha256 <第 4 步的快照 sha> \
+  --artifact "<第 3 步的 sha> <第 3 步的 url>" \
+  --login-server https://hs.example.com \
+  --routes 192.168.31.0/24 \
+  --authkey 'tskey-auth-…'
+```
+
+（`--authkey -` 也行：会在终端提示你粘贴 key，不留在 shell history。管道形式下它优先读终端，所以照样能用。）
+
+也可以先 scp 再装（完全离线，见「五、路由器」的方式 C）。
+
+**检查点**：安装脚本最后提示"下一步：ts-doctor"。等 30 秒左右，然后：
+
+```sh
+ts-doctor        # 期望：没有 FAIL；"运行态"里能看到二进制、daemon、socket
+```
+
+## 7. 注册
+
+| 你用的工件 | 怎么注册 |
+|---|---|
+| **自编译单二进制**（本文推荐） | **自动**。安装时给了 `--authkey`，`tailscale-ram` 拉完二进制就会自己 `up`，等 10–60 秒即可 |
+| 官方静态包 | 需要手工一次：`ts-login`（它会临时拉 CLI，注册完自动删掉） |
+
+**检查点**：
+
+```sh
+ts-status                 # 应看到自己的节点在线
+headscale nodes list      # 服务器上应出现 r4a-home 之类的节点
+```
+
+## 8. 批准路由
+
+```sh
+headscale routes list
+headscale routes enable -r <route-id>
+```
+
+或者用第 5 步打印的 `autoApprovers` 片段写进 headscale 的 `config.yaml`，重启 headscale 后免人工批准。
+
+**检查点**：`headscale routes list` 里家网段是 `enabled`。
+
+## 9. 客户端验证 + 重启验证（别跳过）
+
+客户端（手机 / 笔记本）**必须开** `--accept-routes`（手机端叫 "Use Tailscale subnets"），ACL 也要放行该网段。
+
+然后**重启路由器**，这是最关键的一步：
+
+```sh
+reboot
+# 回来后
+ts-status                 # 节点应自己回来（开机自动重下 9.9MB）
+```
+
+想验证掉线自愈：重启后立刻拔掉 WAN 十几秒，`tail -f /tmp/ts-fetch.log` 里应出现
+`拉取失败（第 N 次），Xs 后重试`；把网接回来，它会自己恢复，不用你做任何事。
+
+---
+
+## 部署最短路径（老手速查）
+
+```sh
+# 电脑
+bash server/build-selfbuild.sh && scp out/tailscaled_*_mipsle root@<vps>:/root/
+
+# VPS
+mkdir -p /srv/ts
+SOURCE=local BINARY=/root/tailscaled_1.102.4_mipsle \
+  OUT=/srv/ts BASE_URL=https://dl.example.com/ts/<token> bash server/make-artifact.sh
+REF=$(git rev-parse HEAD) OUT=/srv/ts BASE_URL=https://dl.example.com/ts/<token> \
+  bash server/make-repo-archive.sh
+bash server/headscale-bootstrap.sh --user home --routes 192.168.31.0/24
+
+# 路由器（把上面两步打印的值填进去）
+wget -O- https://dl.example.com/ts/<token>/bootstrap.sh | sh -s -- \
+  --base-url https://dl.example.com/ts/<token> --ref <commit> --sha256 <快照sha> \
+  --artifact "<sha> <url>" --login-server https://hs.example.com \
+  --routes 192.168.31.0/24 --authkey 'tskey-…'
+
+# 验证
+ts-doctor && ts-status
+```
+
+## 卡住了看哪节
+
+| 现象 | 去哪 |
+|---|---|
+| 编译报错、产物跑不起来 | 「一、先看实测结论」+「七、排错」 |
+| 不知道哪里不对 | 直接跑 `ts-doctor`，它会指明 |
+| 下载失败 / sha 不匹配 | 「七、排错」前两行 |
+| 节点上线了但访问不了内网 | 「六、验证」+「七、排错」 |
+| 重启后节点掉线 | 「五、路由器 → 4. 运行期行为」里的退避重试说明 |
+
+---
+
+# 四、服务器（广州 VPS）
 
 ## 0. 推荐：先在自己电脑上编一个单二进制
+
+> 这一步就是「三、从零部署」的第 1、2 步，这里只展开细节。
 
 比官方包小一半、且自带 CLI，所以不需要"注册时临时拉 CLI"这套绕路。
 
@@ -180,7 +374,7 @@ bash server/headscale-bootstrap.sh --user home --routes 192.168.31.0/24
 
 ---
 
-# 四、路由器
+# 五、路由器
 
 > **先说清楚两件事**，否则容易误判：
 >
@@ -190,6 +384,8 @@ bash server/headscale-bootstrap.sh --user home --routes 192.168.31.0/24
 > 也就是说：路由器开机连不连 GitHub，完全取决于你把什么写进了 `TS_ARTIFACTS`。**国内家宽不要把 GitHub 放进 `TS_ARTIFACTS`** —— 每次重启都要重新下载（二进制在 tmpfs 里），源不可达时节点就是掉线状态。
 
 ## 1. 落地（三种方式，选一个）
+
+> 对应「三、从零部署」的第 6 步；这里把三种安装方式的参数展开。
 
 **方式 A：从自己的服务器装（推荐，路由器完全不碰 GitHub）**
 
@@ -317,7 +513,7 @@ ts-login
 
 ---
 
-# 五、验证
+# 六、验证
 
 **第一件事：跑 `ts-doctor`。** 它只读，逐项体检并给出结论，比翻日志快：
 
@@ -363,7 +559,7 @@ headscale routes list              # 家网段应为 enabled
 
 ---
 
-# 六、排错
+# 七、排错
 
 | 现象 | 处理 |
 |---|---|
@@ -383,7 +579,7 @@ headscale routes list              # 家网段应为 enabled
 
 ---
 
-# 七、取舍（如实说明）
+# 八、取舍（如实说明）
 
 - **每次重启重下 9.9MB**（自编译单二进制）或 17.7MB（官方包）：这是不占 flash 的代价。
   ⚠️ **这个源必须是家宽开机时稳定可达的**。加备源的初衷是降单点风险，但国内把 GitHub 当备源会适得其反：

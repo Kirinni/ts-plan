@@ -136,7 +136,28 @@ while [ "$#" -gt 0 ]; do
 		--authkey)
 			[ "$#" -ge 2 ] || fail "--authkey 缺参数"
 			if [ "$2" = "-" ]; then
-				AUTHKEY_ARG="$(cat)"
+				# 【坑】`wget -O- …/bootstrap.sh | sh -s -- --authkey -` 时 stdin 是脚本本身，
+				# 直接读 stdin 只能拿到空值（曾经静默失败成"authkey 为空"）。
+				# 所以优先从**控制终端**读 —— SSH 会话里 /dev/tty 就是你的键盘。
+				AUTHKEY_ARG=""
+				if [ -r /dev/tty ]; then
+					printf '粘贴 preauthkey 后回车: ' > /dev/tty 2>/dev/null || true
+					# 【坑】不能写成 `read -r X || X=""`：没有换行结尾时 read 读到数据
+					# 也会返回非 0，那样会把刚读到的 key 又清空。用 `|| true` 只忽略状态。
+					IFS= read -r AUTHKEY_ARG < /dev/tty 2>/dev/null || true
+					printf '\n' > /dev/tty 2>/dev/null || true
+				fi
+				if [ -z "$AUTHKEY_ARG" ]; then
+					# 没有可用终端（cron / 纯管道）时退回 stdin
+					IFS= read -r AUTHKEY_ARG 2>/dev/null || true
+				fi
+				if [ -z "$AUTHKEY_ARG" ]; then
+					fail "--authkey - 读不到内容（既没有可用终端，stdin 也不是 key）。
+	两种可靠写法：
+	  a) 把 key 直接写在参数里：--authkey 'tskey-auth-xxx'
+	  b) 先把脚本落盘再执行，这样 stdin 才是你的终端：
+	     wget -O /tmp/ts-bootstrap.sh <脚本地址> && sh /tmp/ts-bootstrap.sh … --authkey -"
+				fi
 			else
 				AUTHKEY_ARG="$2"
 			fi
