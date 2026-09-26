@@ -23,11 +23,26 @@ host_of() {
 }
 
 # 优先用 curl（自带超时/重试），退化到 busybox wget
+#
+# 这几个超时是"重启别掉线"的关键：某个源不可达时必须**快速失败并回退到下一个源**，
+# 而不是把开机后的拉取卡在一条死连接上（黑名单 IP 上 SYN 会被丢弃，默认会挂很久）。
+#   DL_CONNECT_TIMEOUT  TCP 连接超时（秒）
+#   DL_MAX_TIME         单次下载总时长上限（秒）
+#   DL_STALL_TIME/LIMIT 连续这么多秒低于这么多 B/s 就中断 —— 专治"连上了但不动"
+DL_CONNECT_TIMEOUT="${DL_CONNECT_TIMEOUT:-10}"
+DL_MAX_TIME="${DL_MAX_TIME:-300}"
+DL_STALL_TIME="${DL_STALL_TIME:-30}"
+DL_STALL_LIMIT="${DL_STALL_LIMIT:-1024}"
 download() { # $1=url $2=dest
 	if command -v curl >/dev/null 2>&1; then
-		curl -fL --connect-timeout 10 --max-time 900 --retry 2 --retry-delay 5 -o "$2" "$1"
+		curl -fL \
+			--connect-timeout "$DL_CONNECT_TIMEOUT" \
+			--max-time "$DL_MAX_TIME" \
+			--speed-limit "$DL_STALL_LIMIT" --speed-time "$DL_STALL_TIME" \
+			--retry 1 --retry-delay 5 \
+			-o "$2" "$1"
 	else
-		wget -T 60 -O "$2" "$1"
+		wget -T "$DL_CONNECT_TIMEOUT" -O "$2" "$1"
 	fi
 }
 
@@ -48,16 +63,23 @@ stamp_ok() { # $1=stamp 名  $2=sha256
 }
 
 wait_network() {
-	first_url="$(printf '%s\n%s\n' "$TS_ARTIFACTS" "${TS_CLI_ARTIFACTS:-}" \
-		| awk 'NF >= 2 && $1 !~ /^#/ { print $2; exit }')"
-	[ -n "$first_url" ] || return 0
-	h="$(host_of "$first_url")"
+	# 收集所有工件的 host：**任意一个**能解析就说明网络通了。
+	# 只盯第一个源的话，第一个源恰好 DNS 不通就会白等 3 分钟 —— 这也是"重启掉线"的常见成因。
+	hosts="$(printf '%s\n%s\n' "$TS_ARTIFACTS" "${TS_CLI_ARTIFACTS:-}" \
+		| awk 'NF >= 2 && $1 !~ /^#/ { print $2 }' | while read -r u; do host_of "$u"; done)"
+	[ -n "$hosts" ] || return 0
 	i=0
 	while [ "$i" -lt 36 ]; do
-		if ip route show default 2>/dev/null | grep -q '^default' \
-		   && nslookup "$h" >/dev/null 2>&1; then
-			log "网络就绪（$h 可解析）"
-			return 0
+		if ip route show default 2>/dev/null | grep -q '^default'; then
+			for h in $hosts; do
+				case "$h" in
+					"" | localhost | 127.* | ::1) return 0 ;;
+				esac
+				if nslookup "$h" >/dev/null 2>&1; then
+					log "网络就绪（$h 可解析）"
+					return 0
+				fi
+			done
 		fi
 		sleep 5
 		i=$((i + 1))

@@ -16,17 +16,22 @@
 #
 # 自己的参数（下面这些会被吃掉，其余原样传给 install.sh）：
 #   --ref <git-ref>       要拉取的 commit / 分支 / tag（默认 main，建议写 40 位 commit）
+#   --sha256 <hex>        校验下载到的快照；强烈建议用在自建分发点上
 #   --base-url <url>      仓库地址前缀，默认 https://github.com/$TS_PLAN_REPO
 #                         支持 file:// 前缀，便于离线测试
 #   --from <dir>          直接用本地已解压的仓库目录，完全不联网
 #   --keep                保留解压出来的临时目录（排错用）
 #   -h | --help
 #
-# 环境变量：TS_PLAN_REPO=owner/repo  TS_PLAN_REF=<ref>
+# 注意：本脚本只在**安装/升级时**跑一次，不在开机路径上。
+#       开机只由 ts-fetch 拉 TS_ARTIFACTS 里列的地址（通常是你的 VPS），不碰 GitHub。
+#
+# 环境变量：TS_PLAN_REPO=owner/repo  TS_PLAN_REF=<ref>  TS_PLAN_SHA256=<hex>
 set -u
 
 REPO="${TS_PLAN_REPO:-Kirinni/ts-plan}"
 REF="${TS_PLAN_REF:-main}"
+SHA256="${TS_PLAN_SHA256:-}"
 BASE="${TS_PLAN_BASE:-https://github.com/$REPO}"
 FROM=""
 KEEP=0
@@ -59,6 +64,11 @@ while [ "$#" -gt 0 ]; do
 		--ref)
 			need_val --ref "$#"
 			REF="$2"
+			shift 2
+			;;
+		--sha256)
+			need_val --sha256 "$#"
+			SHA256="$2"
 			shift 2
 			;;
 		--base-url)
@@ -125,13 +135,25 @@ else
 			fetch "$url" "$TMPD/repo.tgz" || fail "下载失败（网络/代理？也可以先 scp 一份再用 --from）"
 			;;
 	esac
+
+	# 自建分发点时建议带上 --sha256：万一分发点被动了手脚，也装不进去
+	if [ -n "$SHA256" ]; then
+		command -v sha256sum >/dev/null 2>&1 || fail "本机没有 sha256sum，无法校验 --sha256"
+		got="$(sha256sum "$TMPD/repo.tgz" | cut -d' ' -f1)"
+		if [ "$got" != "$SHA256" ]; then
+			echo "!! 仓库快照校验失败，已丢弃" >&2
+			echo "   期望 $SHA256" >&2
+			echo "   实际 $got" >&2
+			exit 1
+		fi
+		echo ">> 快照 sha256 校验通过"
+	fi
 	tar -xzf "$TMPD/repo.tgz" -C "$TMPD" || fail "解压失败（不是有效的 tar.gz？）"
 	SRC="$(find "$TMPD" -maxdepth 1 -type d -name '*ts-plan*' | head -n1)"
 	[ -n "$SRC" ] || fail "解压后没找到仓库目录"
 	[ -f "$SRC/router/install.sh" ] || fail "$SRC/router/install.sh 不存在"
 	echo ">> 解压到 $SRC"
 fi
-
 echo
 sh "$SRC/router/install.sh" "$@"
 exit $?

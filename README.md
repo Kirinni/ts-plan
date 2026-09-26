@@ -48,6 +48,7 @@ flowchart LR
 |---|---|
 | `server/build-selfbuild.sh` | 本地：交叉编译单二进制，断言 CLI 行为 + 软浮点 + 静态（没 Go 会自己装） |
 | `server/make-artifact.sh` | VPS：打成 `tar.gz` + sha256，并生成可直接用的 `ts.conf.local` |
+| `server/make-repo-archive.sh` | VPS：导出仓库快照 + bootstrap 到分发点，让路由器不碰 GitHub |
 | `server/headscale-bootstrap.sh` | VPS：建 user、发 preauthkey、打印 autoApprovers 片段 |
 | `server/nginx-ts.conf.example` | VPS：443 + 随机路径托管工件 |
 | `router/bootstrap.sh` | 路由器：从仓库拉一份快照并安装（**免 scp**） |
@@ -181,12 +182,45 @@ bash server/headscale-bootstrap.sh --user home --routes 192.168.31.0/24
 
 # 四、路由器
 
-## 1. 落地（两种方式，二选一）
+> **先说清楚两件事**，否则容易误判：
+>
+> 1. **`bootstrap.sh` 只在安装/升级时跑一次，不在开机路径上。**
+> 2. **开机路径只访问 `TS_ARTIFACTS` 里列的地址**（通常是你的 VPS）。`ts-fetch`、`tailscale-ram`、`ts-login` 里没有任何 GitHub 相关代码。
+>
+> 也就是说：路由器开机连不连 GitHub，完全取决于你把什么写进了 `TS_ARTIFACTS`。**国内家宽不要把 GitHub 放进 `TS_ARTIFACTS`** —— 每次重启都要重新下载（二进制在 tmpfs 里），源不可达时节点就是掉线状态。
 
-**方式 A：一条命令从仓库装（不用 scp，推荐）**
+## 1. 落地（三种方式，选一个）
+
+**方式 A：从自己的服务器装（推荐，路由器完全不碰 GitHub）**
+
+在 VPS 上把仓库快照也放到分发点（和工件同一个 nginx location 即可）：
 
 ```sh
-wget -O- https://raw.githubusercontent.com/Kirinni/ts-plan/main/router/bootstrap.sh | sh -s -- \
+# VPS 上（本仓库的一份 clone 里）
+REF=<commit> OUT=/srv/ts BASE_URL=https://dl.example.com/ts/<token> \
+  bash server/make-repo-archive.sh
+```
+
+它会导出 `archive/<commit>.tar.gz`、把 `bootstrap.sh` 放到同一目录，并打印路由器上要执行的命令（含快照 sha256）：
+
+```sh
+# 路由器上
+wget -O- https://dl.example.com/ts/<token>/bootstrap.sh | sh -s -- \
+  --base-url https://dl.example.com/ts/<token> \
+  --ref <commit> \
+  --sha256 <快照 sha256> \
+  --artifact "<sha256> <url>" \
+  --login-server https://hs.example.com \
+  --routes 192.168.31.0/24 \
+  --authkey -
+```
+
+`--sha256` 会校验下载到的快照，分发点被动手脚也装不进去。按提示把 preauthkey 粘进去回车（`--authkey -` 从 stdin 读，不会留在 shell history）。
+
+**方式 B：直接从 GitHub 装（只在路由器能顺畅访问 GitHub 时才用）**
+
+```sh
+wget -O- https://raw.githubusercontent.com/Kirinni/ts-plan/<commit>/router/bootstrap.sh | sh -s -- \
   --ref <commit> \
   --artifact "<sha256> <url>" \
   --login-server https://hs.example.com \
@@ -194,11 +228,10 @@ wget -O- https://raw.githubusercontent.com/Kirinni/ts-plan/main/router/bootstrap
   --authkey -
 ```
 
-按提示把 preauthkey 粘进去回车（`--authkey -` 从 stdin 读，不会留在 shell history）。装完配置已经写好，直接可用。
+> `--ref` 一定写具体 commit（内容不可变），别跟 `main`：公开仓库一旦被改动，你的生产脚本会跟着变。
+> 这条路只有**安装那一次**会碰 GitHub，之后开机都不会。
 
-> `--ref` 建议写具体 commit（内容不可变），别只跟 `main`：公开仓库一旦被改动，你的生产脚本会跟着变。
-
-**方式 B：先拷文件再装**
+**方式 C：先拷文件再装（完全离线）**
 
 ```sh
 scp -r router/* root@192.168.31.1:/root/ts-kit/
@@ -207,6 +240,8 @@ sh /root/ts-kit/install.sh \
   --login-server https://hs.example.com \
   --routes 192.168.31.0/24
 ```
+
+也可以 `bootstrap.sh --from <已解压目录>`：快照由你自己拷过去，全程零下载。
 
 `install.sh` 的全部参数（`-h` 也能看）：
 
@@ -268,7 +303,14 @@ ts-login
 设计要点：
 
 - 开机 `START=99` 检查 tmpfs 里有没有二进制，没有就**后台**拉取，成功后自动重入 `start`，不阻塞启动。
-- 拉取前等网络就绪（默认路由 + DNS），`MAX_ATTEMPTS × 工件数` 轮重试 + 退避；`/tmp/.ts-fetch-running` 防止并发重复拉取。
+- **拉不到就一直退避重试**：`fetch_loop` 会重试 `FETCH_ATTEMPTS`（默认 12）轮，间隔 1×60s、2×60s… 封顶 30 分钟 ——
+  开机时 VPS 还没通、家宽刚拨号、DNS 没就绪，都能自己恢复，不用你手动干预。
+- **`tailscale up` 失败也重试**：`up_loop` 最多试 `UP_ATTEMPTS`（默认 5）次，间隔 30s…封顶 5 分钟。
+  启动时 headscale 不可达、tailnet 握手失败都属于“稍后会好”，不应试一次就放羊。
+- **下载超时是“快速失败”设计**：连接 10s、单次总时长 300s、连续 30s 低于 1KB/s 就中断。
+  目的是让不可达的源尽快让位给下一个源，而不是把开机后的拉取卡在一条死连接上。
+- 拉取前等网络就绪（默认路由 + **任意一个**工件主机可解析，不是只盯第一个）；
+  `MAX_ATTEMPTS × 工件数` 轮重试 + 退避；`/tmp/.ts-fetch-running` 防止并发重复拉取。
 - 缓存标记 `.installed.sha256` / `.cli.sha256`：同一次开机内重启服务不会重复下载。
 - `--accept-dns=false`（路由器自己跑 dnsmasq）、`--snat-subnet-routes=true`（家里设备无需配置路由）。
 - `TMPFS_SIZE=96m`：只抬高上限、不预分配；为的是首装能放下两个二进制。
@@ -343,7 +385,9 @@ headscale routes list              # 家网段应为 enabled
 
 # 七、取舍（如实说明）
 
-- **每次重启重下 9.9MB**（自编译单二进制）或 17.7MB（官方包）：这是不占 flash 的代价。把工件多放一两个地方（第二台机器/对象存储）能显著降低单点失败概率。
+- **每次重启重下 9.9MB**（自编译单二进制）或 17.7MB（官方包）：这是不占 flash 的代价。
+  ⚠️ **这个源必须是家宽开机时稳定可达的**。加备源的初衷是降单点风险，但国内把 GitHub 当备源会适得其反：
+  它经常超时/被重置，反而拖慢回退。更好的备源：第二台机器、对象存储、或同一 VPS 上的第二条路径（不同域名/端口）。
 - **自编译方案下内存很宽裕**：常驻一个 30.5MB 的文件，日常压力约 55–80MB。
   走官方包时才紧张：首装 daemon+CLI 同时在内存约 85MB，必要时先 `wifi down` 再 `ts-login`。
 - **state 写在 overlay**：写入频率低（状态变化/密钥轮换），但确实消耗 NOR 寿命。

@@ -13,6 +13,58 @@ USE_PROCD=1
 
 TS_DAEMON="$TS_DIR/tailscaled"
 TS_CLI="$TS_DIR/tailscale"
+TS_FETCH="${TS_FETCH:-/usr/sbin/ts-fetch}"
+TS_INITD="${TS_INITD:-/etc/init.d/tailscale-ram}"
+FETCH_LOCK="${FETCH_LOCK:-/tmp/.ts-fetch-running}"
+FETCH_LOG="${FETCH_LOG:-/tmp/ts-fetch.log}"
+UP_LOG="${UP_LOG:-/tmp/ts-up.log}"
+
+# 拉取失败后的重试策略（开机拉不到就掉线，所以要一直试下去，别试一次就放弃）
+FETCH_ATTEMPTS="${FETCH_ATTEMPTS:-12}"  # 最多重试几轮（每轮退避递增，封顶 30 分钟）
+FETCH_DELAY="${FETCH_DELAY:-60}"        # 第一轮重试前等多少秒
+UP_ATTEMPTS="${UP_ATTEMPTS:-5}"         # tailscale up 失败后的重试次数
+UP_DELAY="${UP_DELAY:-30}"              # up 重试的基础退避（秒），递增且封顶 5 分钟
+
+# 二进制拉取循环：失败就退避重试，成功或超过上限才返回
+# 返回 0 = 二进制已就绪
+fetch_loop() {
+	i=0
+	while [ ! -x "$TS_DAEMON" ]; do
+		"$TS_FETCH"
+		[ -x "$TS_DAEMON" ] && break
+		i=$((i + 1))
+		if [ "$i" -ge "$FETCH_ATTEMPTS" ]; then
+			logger -t tailscale-ram "拉取重试 $i 次仍失败，放弃（可手动 ts-fetch / 重启本服务）"
+			return 1
+		fi
+		d=$((FETCH_DELAY * i))
+		[ "$d" -gt 1800 ] && d=1800
+		logger -t tailscale-ram "拉取失败（第 $i 次），${d}s 后重试"
+		sleep "$d"
+	done
+	logger -t tailscale-ram "二进制已就绪：$TS_DAEMON"
+	return 0
+}
+
+# up 循环：网络/headscale 还没准备好时不要只试一次就不管了
+up_loop() {
+	i=0
+	while :; do
+		ts_up
+		rc=$?
+		[ "$rc" = 0 ] && return 0
+		[ "$rc" = 2 ] && return 1   # 尚未注册，重试没意义
+		i=$((i + 1))
+		if [ "$i" -ge "$UP_ATTEMPTS" ]; then
+			logger -t tailscale-ram "tailscale up 重试 $i 次仍失败，放弃"
+			return 1
+		fi
+		d=$((UP_DELAY * i))
+		[ "$d" -gt 300 ] && d=300
+		logger -t tailscale-ram "tailscale up 失败（第 $i 次），${d}s 后重试"
+		sleep "$d"
+	done
+}
 
 # 等服务起来后执行 tailscale up（幂等，可反复调用）
 ts_up() {
@@ -23,7 +75,7 @@ ts_up() {
 			return 0
 		fi
 		logger -t tailscale-ram "无 CLI 且无 state：尚未注册，请执行 ts-login"
-		return 1
+		return 2
 	fi
 
 	i=0
@@ -64,33 +116,27 @@ start_service() {
 	mkdir -p "$TS_DIR" "$STATE_DIR"
 	chmod 0700 "$STATE_DIR" 2>/dev/null
 
-	# 已经在跑：只确保 up 参数生效
+	# 已经在跑：只确保 up 参数生效（失败会退避重试）
 	if pidof tailscaled >/dev/null 2>&1; then
 		logger -t tailscale-ram "tailscaled 已在运行，仅确保 up"
-		( ts_up ) >>/tmp/ts-up.log 2>&1 &
+		( up_loop ) >>"$UP_LOG" 2>&1 &
 		return 0
 	fi
 
 	# tmpfs 里没有二进制 -> 后台拉取，成功后重入 start（不阻塞开机）
 	if [ ! -x "$TS_DAEMON" ]; then
-		if [ -e /tmp/.ts-fetch-running ]; then
+		if [ -e "$FETCH_LOCK" ]; then
 			logger -t tailscale-ram "拉取已在进行中"
 			return 0
 		fi
-		touch /tmp/.ts-fetch-running
+		touch "$FETCH_LOCK"
 		logger -t tailscale-ram "tmpfs 中无二进制，开始后台拉取"
 		(
-			/usr/sbin/ts-fetch
-			rc=$?
-			rm -f /tmp/.ts-fetch-running
-			if [ "$rc" != "0" ]; then
-				logger -t tailscale-ram "拉取失败，10 分钟后再试一次"
-				sleep 600
+			trap 'rm -f "$FETCH_LOCK"' EXIT INT TERM
+			if fetch_loop; then
+				"$TS_INITD" restart
 			fi
-			if [ -x /tmp/tailscale/tailscaled ]; then
-				/etc/init.d/tailscale-ram restart
-			fi
-		) >>/tmp/ts-fetch.log 2>&1 &
+		) >>"$FETCH_LOG" 2>&1 &
 		return 0
 	fi
 
@@ -105,11 +151,11 @@ start_service() {
 	procd_set_param stderr 1
 	procd_close_instance
 
-	( ts_up ) >>/tmp/ts-up.log 2>&1 &
+	( up_loop ) >>"$UP_LOG" 2>&1 &
 }
 
 stop_service() {
-	rm -f /tmp/.ts-fetch-running
+	rm -f "$FETCH_LOCK"
 	if [ -S "$SOCKET" ] && [ -x "$TS_CLI" ]; then
 		"$TS_CLI" --socket="$SOCKET" down >/dev/null 2>&1
 	fi
