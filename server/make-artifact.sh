@@ -164,46 +164,10 @@ fi
 
 # ---------------------------------------------------------------------------
 # 生成可直接 scp 到路由器的配置覆盖文件（省掉手抄那一行长 URL）
+# 生成逻辑在 make-ts-conf.sh 里 —— pull-release.sh（从 GitHub Release 拉）也用同一份，
+# 免得两边写出的配置格式不一致。
 # ---------------------------------------------------------------------------
-CFG="$OUT/ts.conf.local"
-{
-	echo "# 由 make-artifact.sh 生成（$(date '+%F %T')）"
-	echo "# 目标位置：/etc/tailscale/ts.conf.local（ts.conf 会自动 source 它）"
-	echo "# 放在这里而不是改 ts.conf：重跑 install.sh 不会覆盖它。"
-	echo
-	if [ -s "$work/daemon.lines" ]; then
-		echo 'TS_ARTIFACTS="'
-		cat "$work/daemon.lines"
-		echo '"'
-	fi
-	if [ -s "$work/cli.lines" ]; then
-		echo 'TS_CLI_ARTIFACTS="'
-		cat "$work/cli.lines"
-		echo '"'
-	fi
-	echo
-	if [ "$LOGIN_SERVER" = "https://hs.example.com" ] || [ "$ADVERTISE_ROUTES" = "192.168.31.0/24" ]; then
-		echo "# 注意：下面仍是示例值（留着会被 install.sh / ts-doctor 报警），改成你自己的"
-	else
-		echo "# 下面两项来自构建时的 LOGIN_SERVER / ADVERTISE_ROUTES，可直接用"
-	fi
-	echo "LOGIN_SERVER=$LOGIN_SERVER"
-	echo "ADVERTISE_ROUTES=$ADVERTISE_ROUTES"
-} > "$CFG"
-
-echo
-echo "==================== 给路由器的配置 ===================="
-echo "文件：$CFG"
-echo "两种用法二选一："
-echo "  A) 拷文件：scp $CFG root@192.168.31.1:/etc/tailscale/ts.conf.local"
-echo "  B) 当参数传（不拷文件，装的时候直接写进去）："
-while read -r sha url; do
-	echo "       --artifact \"$sha $url\""
-done < "$work/daemon.lines"
-if [ -s "$work/cli.lines" ]; then
-	while read -r sha url; do
-		echo "       --cli-artifact \"$sha $url\""
-	done < "$work/cli.lines"
-fi
-echo
-echo "提示：换版本/重新打包后 sha256 会变 —— 重跑本脚本重新生成即可。"
+GENERATOR=make-artifact.sh \
+OUT="$OUT" BASE_URL="$BASE_URL" \
+LOGIN_SERVER="$LOGIN_SERVER" ADVERTISE_ROUTES="$ADVERTISE_ROUTES" \
+	bash "$(dirname "$0")/make-ts-conf.sh" "$work/daemon.lines" "$work/cli.lines"

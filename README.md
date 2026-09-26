@@ -50,7 +50,9 @@ flowchart LR
 | 路径 | 用途 |
 |---|---|
 | `server/build-selfbuild.sh` | 本地：交叉编译单二进制，断言 CLI 行为 + 软浮点 + 静态（没 Go 会自己装） |
-| `.github/workflows/build.yml` | **CI：上面这套流程在 GitHub 上跑完 + 自动上传到 VPS**（见「三 → 2.5」） |
+| `.github/workflows/build.yml` | **CI：编译 → 打包 → 导出快照 → 发 Release**（见「三 → 2.5」） |
+| `server/pull-release.sh` | **VPS：一条命令把 CI 发的 Release 拉下来铺到分发点**（不用 scp、不用密钥） |
+| `server/make-ts-conf.sh` | 生成 `ts.conf.local`（`make-artifact.sh` 与 `pull-release.sh` 共用同一份格式） |
 | `server/make-artifact.sh` | VPS：打成 `tar.gz` + sha256，并生成可直接用的 `ts.conf.local` |
 | `server/make-repo-archive.sh` | VPS：导出仓库快照 + bootstrap 到分发点，让路由器不碰 GitHub |
 | `server/headscale-bootstrap.sh` | VPS：建 user、发 preauthkey、打印 autoApprovers 片段 |
@@ -71,6 +73,9 @@ flowchart LR
 > 涉及三台机器：**你的电脑**（编译）→ **VPS**（分发 + headscale）→ **路由器**（运行）。
 > 每步末尾有**检查点**，过不了就别往下走。出错先看「七、排错」。
 > 全程只有第 3、4、6 步需要替换成你自己的值（域名 / token / 网段）。
+>
+> 不想在本机装 Go、也不想 scp？第 1、3 步可以完全交给 GitHub Actions（见 2.5）：
+> 电脑上什么都不用装，VPS 上只需跑一次 `server/pull-release.sh`（脚本本身从仓库拿一份即可）。
 
 ## 0. 前提
 
@@ -105,57 +110,72 @@ bash server/build-selfbuild.sh            # 默认 VER=1.102.4
 scp out/tailscaled_1.102.4_mipsle root@<你的VPS>:/root/
 ```
 
-> 不想手做第 1、2 步（也不想在 VPS 上留一份仓库 clone）？直接看下面的 **2.5** ——
-> GitHub Actions 会把编译、打包、仓库快照、上传全做完，你只要复制它打印的一条命令。
+> 不想手做第 1、2、3 步？直接看下面的 **2.5** —— GitHub Actions 负责编和打包（不用本机装 Go），
+> VPS 再用一条命令把它拉下来（不用 scp、不用配密钥）。
 
-## 2.5 让 GitHub Actions 干（可选，但真的省事）
+## 2.5 让 GitHub Actions 编，VPS 自己拉（可选，但真的省事）
 
-`.github/workflows/build.yml` 在 GitHub 的机器上把四件事一次做完，等价于本机做第 1、2 步 +
-VPS 上做第 3、4 步：
+`.github/workflows/build.yml` 在 GitHub 的机器上把三件事做完，等价于本机做第 1 步 + 第 3 步：
 
 ```
-编译                       server/build-selfbuild.sh（CLI 行为 / 软浮点 / 静态 三项断言）
-打包                       server/make-artifact.sh   → tar.gz + sha256 + ts.conf.local
-仓库快照                   server/make-repo-archive.sh → archive/<commit>.tar.gz + bootstrap.sh
-上传（tar over ssh）       → VPS 的分发目录，然后再下一遍回验 sha256
+编译         server/build-selfbuild.sh     （CLI 行为 / 软浮点 / 静态 三项断言）
+打包         server/make-artifact.sh       → tar.gz + sha256 + ts.conf.local
+仓库快照     server/make-repo-archive.sh   → archive/<commit>.tar.gz + bootstrap.sh
+发 Release   固定文件名 + BUILD_INFO.txt   → 供 VPS / 路由器匿名下载
 ```
 
-在仓库里配一次（**Settings → Secrets and variables → Actions**）：
+**为什么不让 CI 直接 ssh 推给 VPS**：那要在 GitHub 侧存一把能登你服务器的私钥 —— GitHub 侧
+一旦出事（账号被撞、第三方 Action 被投毒），丢的不只是仓库，而是服务器。改成"VPS 主动拉"之后，
+**GitHub 侧一个密钥都不用存**，而且公开仓库的 Release 是匿名可下的，连下载凭据都不需要。
+（如果你确实想 CI 直接推，`2b553d7` 那版实现还在 git 历史里。）
 
-| 名字 | 类型 | 默认 | 说明 |
-|---|---|---|---|
-| `TS_SSH_KEY` | Secret | — | 部署用私钥；**不配就只产出工件、不上传** |
-| `TS_DEPLOY_HOST` | Secret | — | VPS 地址 |
-| `TS_DEPLOY_USER` | Secret | `root` | |
-| `TS_DEPLOY_PORT` | Secret | `22` | |
-| `TS_DEPLOY_PATH` | Secret | `/srv/ts` | 要和 `nginx-ts.conf.example` 里的 root 一致 |
-| `TS_SSH_KNOWN_HOSTS` | Secret | — | 可选；不配就用 `ssh-keyscan` 取 |
-| `TS_BASE_URL` | Variable | `https://dl.example.com/ts/CHANGE_ME_TOKEN` | 分发前缀，用来生成 `ts.conf.local` 和打印安装命令 |
-| `TS_LOGIN_SERVER` | Variable | `https://hs.example.com` | 写进 `ts.conf.local` |
-| `TS_ADVERTISE_ROUTES` | Variable | `192.168.31.0/24` | 同上 |
-| `TS_VER` | Variable | `1.102.4` | 默认编哪个版本 |
+### 怎么用
 
-怎么触发：
+1. **让 CI 编 + 发 Release**（二选一）：
 
-| 方式 | 行为 |
-|---|---|
-| Actions 页面 *Run workflow* | 可填版本号 / 分发前缀 / 是否上传（默认上传） |
-| `git tag v1.102.4 && git push origin v1.102.4` | 版本号自动取 tag 名，编完建 Release 并自动上传 |
-| 改到 `server/` `router/` 的 PR | 只跑脚本语法/行尾检查和编译，不上传 |
+   | 方式 | 行为 |
+   |---|---|
+   | `git tag v1.102.4 && git push origin v1.102.4` | 版本号取 tag 名，编完自动发 Release（推荐） |
+   | Actions 页面 *Run workflow* | 可填版本号 / Release 标签（留空就只编不发） |
+   | 改到 `server/` `router/` 的 PR | 只跑脚本语法/行尾检查 + 编译，不发 Release |
 
-跑完看 job 的 **Summary** 页签：里面直接给出第 6 步要用的那条完整安装命令（复制粘贴即可），
-不用再手工拼 sha256 和 URL。同时还会产出 `dist/INSTALL.txt` 和一个 Actions Artifact
-（保留 90 天，可以当历史版本回滚用）。
+   可选的 Variables（**Settings → Secrets and variables → Actions**，都不是机密，纯省打字）：
+   `TS_BASE_URL`（分发前缀）、`TS_LOGIN_SERVER`、`TS_ADVERTISE_ROUTES`、`TS_VER`。
+   **Secrets 一个都不用配。**
 
-**检查点**：job 末尾出现 `OK 已铺到 root@<vps>:/srv/ts`，并且
-`OK 分发点上的 tar.gz 与本地一致：<sha256>`。后者是 CI 自己回下一遍、比对 sha256 ——
-通了就说明 nginx/token 都对，第 6 步可以放心跑。
+2. **在 VPS 上一条命令拉下来铺好**：
 
-> 还没配 VPS 的 SSH？那就别配 `TS_SSH_KEY`：job 会照常编完并提示 "未上传"，
-> 二进制从 Actions 的 Artifacts 里下载即可（`ts-artifact-mipsle-<ver>.zip`）。
+   ```sh
+   # VPS 上（本仓库的一份 clone 里）
+   REPO=Kirinni/ts-plan TAG=latest OUT=/srv/ts \
+   BASE_URL=https://dl.example.com/ts/<你的token> \
+   LOGIN_SERVER=https://hs.example.com ADVERTISE_ROUTES=192.168.31.0/24 \
+     bash server/pull-release.sh
+   ```
+
+   它会：拉 `BUILD_INFO.txt` 认出版本和 commit → 下载工件并**校验 sha256** → 铺成
+   `/srv/ts/tailscaled_<ver>_mipsle.tar.gz`、`/srv/ts/archive/<commit>.tar.gz`、`/srv/ts/bootstrap.sh`
+   → 生成 `/srv/ts/ts.conf.local` → 把第 6 步要用的整条路由器命令打印出来
+   （顺带回下一遍分发点，确认 nginx 真的能下、且 sha 一致）。
+
+   **检查点**：结尾出现 `OK 分发点上能下到，且 sha256 一致`，以及一段
+   `wget -O- …/bootstrap.sh | sh -s -- …`。那一段就是第 6 步。
+
+   > 拉的是最新那次发布的版本：`TAG=v1.102.4` 可以指定；`TAG=latest` 等于"最近发的那个"。
+   > 完全离线（比如 CI 编完你手动把 zip 传上去）也能用：`--from <目录>`。
+   > 仓库要是转成私有，就在 VPS 上放一把**只读** token：`IN_TOKEN=ghp_…`。
+
+3. 之后的升级就是重复 1、2：CI 编 → VPS 拉 → 路由器上重跑那条命令（`install.sh` 会就地更新）。
+
+**跑完看 job 的 Summary**：里面已经写好上面第 2 步的完整命令（含你的分发点前缀），复制粘贴即可；
+另外还有 Actions Artifact（保留 90 天）和 Release 里的版本化资产，可以当回滚用的历史版本。
+
+> 打包做了可复现处理（固定 tar 的 mtime/uid/gid + `gzip -n`）：同一个二进制在 CI 上重跑、
+> 在别的机器上重打，得到的 tar.gz sha256 都一样，不用每次重抄 `--artifact`。
 >
-> 打包过程做了可复现处理（固定 tar 的 mtime/uid/gid + `gzip -n`）：
-> 同一个二进制重跑 CI 得到**完全一样**的 tar.gz sha256，不用每次重新抄 `--artifact`。
+> 公开仓库的 **run 日志 / Summary 是公开可见的**，而里面带着你的分发点地址（可能含随机 token）。
+> 那个 token 只是"挡住爬虫"用的路径，不是密钥 —— 介意的话就当它是公开地址，或者别把
+> 重要东西放在那条路径后面。
 
 ## 3. 在 VPS 上打包，并生成路由器配置
 
@@ -174,8 +194,8 @@ SOURCE=local BINARY=/root/tailscaled_1.102.4_mipsle \
 
 **检查点**：输出里有 `==================== 给路由器的配置 ====================`，并打印出 `--artifact "<sha> <url>"` 那一行 —— **把这段复制下来，第 6 步要用**。
 
-> 用了 GitHub Actions（2.5）就不用做第 3 步：它会在 VPS 上直接摆好 `tar.gz`、`ts.conf.local`，
-> 并把 `--artifact "<sha> <url>"` 打在 job 的 Summary 里。
+> 用了 GitHub Actions（2.5）就不用做第 3 步：本机编译和 VPS 打包都被 CI 顶掉了，
+> VPS 上只需跑一次 `server/pull-release.sh`。
 
 ## 4. 让 VPS 通过 HTTPS 分发（顺便把仓库快照也放上）
 
@@ -198,8 +218,8 @@ curl -I https://dl.example.com/ts/<token>/bootstrap.sh                       # 2
 
 `make-repo-archive.sh` 会把它算出的**快照 sha256** 和第 6 步要用的完整命令一起打出来。
 
-> 用了 GitHub Actions（2.5）就不用做第 4 步的后半段：它会把 `bootstrap.sh` 和
-> `archive/<commit>.tar.gz` 一起放到分发目录里。
+> 用了 GitHub Actions（2.5）就不用做第 4 步的后半段：`pull-release.sh` 会把 `bootstrap.sh` 和
+> `archive/<commit>.tar.gz` 一起放好。
 
 > 只想最省事、不介意路由器安装时访问 GitHub？第 4 步的后半段可以跳过 —— 安装那一次从 GitHub 取脚本即可，**开机路径仍然只访问你的 VPS**。
 
@@ -280,19 +300,25 @@ ts-status                 # 节点应自己回来（开机自动重下 9.9MB）
 ## 部署最短路径（老手速查）
 
 ```sh
-# 电脑
+# 电脑（手工路线）
 bash server/build-selfbuild.sh && scp out/tailscaled_*_mipsle root@<vps>:/root/
 ```
 
-**又或者：**一步都不在本机跑 —— 配好 secrets 后推个 tag，CI 会把编译 → 打包 → 仓库快照 →
-上传全做完，从 job Summary 里抄那条安装命令就行（详见「三 → 2.5」）：
+**又或者：**本机不装 Go —— 推个 tag 让 CI 编完发 Release，然后在 VPS 上拉一次（详见「三 → 2.5」）：
 
 ```sh
+# 电脑
 git tag v1.102.4 && git push origin v1.102.4
+
+# VPS（不用 scp、不用密钥；结尾会打印第 6 步要用的完整安装命令）
+REPO=Kirinni/ts-plan TAG=latest OUT=/srv/ts \
+  BASE_URL=https://dl.example.com/ts/<token> \
+  LOGIN_SERVER=https://hs.example.com ADVERTISE_ROUTES=192.168.31.0/24 \
+  bash server/pull-release.sh
 ```
 
 ```sh
-# VPS
+# VPS（手工路线）
 mkdir -p /srv/ts
 SOURCE=local BINARY=/root/tailscaled_1.102.4_mipsle \
   OUT=/srv/ts BASE_URL=https://dl.example.com/ts/<token> bash server/make-artifact.sh
