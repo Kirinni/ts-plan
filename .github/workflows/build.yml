@@ -117,8 +117,13 @@ jobs:
         run: |
           set -euo pipefail
           ver="${IN_VER:-}"
+          # tag 名形如 v1.102.4 时顺便当版本号；别的 tag（如 r4a-2026）不当版本号，
+          # 免得拿去 clone 一个不存在的 branch —— 那种情况请用 TS_VER 变量或手填 ver
           if [ -z "$ver" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
-            ver="${GITHUB_REF_NAME}"
+            case "${GITHUB_REF_NAME#v}" in
+              [0-9]*.[0-9]*) ver="${GITHUB_REF_NAME}" ;;
+              *) echo "::notice::tag ${GITHUB_REF_NAME} 不像 Tailscale 版本号，版本改用 TS_VER/默认值" ;;
+            esac
           fi
           [ -n "$ver" ] || ver="${TS_VER:-}"
           ver="${ver#v}"
