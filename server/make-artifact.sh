@@ -15,6 +15,9 @@
 #   $OUT/ts.conf.local —— 可直接 scp 到路由器 /etc/tailscale/ts.conf.local，
 #   省掉手抄那一长行；也能当 install.sh 的 --artifact 参数用。
 #
+# 环境变量 LOGIN_SERVER / ADVERTISE_ROUTES 可以填进生成的 ts.conf.local
+# （不填就是示例值）；GitHub Actions 就是这么把真实配置注入进去的。
+#
 # 为什么（官方包）拆成两个：官方静态构建的 tailscaled 不含 CLI，两个加起来解压后
 # 70.8MB，128MB 内存的 R4A 扛不住；而 CLI 只在注册时需要一次，之后 state 持久化在
 # overlay，daemon 自己就能恢复连接，日常只需 38.7MB 的 tailscaled。
@@ -28,6 +31,8 @@ ARCH_GO="${ARCH_GO:-mipsle}"         # Go 架构名：MT7621 是 mipsel(小端/s
 ARCH_OWRT="${ARCH_OWRT:-mipsel_24kc}"
 OUT="${OUT:-/srv/ts}"
 BASE_URL="${BASE_URL:-https://dl.example.com/ts/CHANGE_ME_TOKEN}"
+LOGIN_SERVER="${LOGIN_SERVER:-https://hs.example.com}"
+ADVERTISE_ROUTES="${ADVERTISE_ROUTES:-192.168.31.0/24}"
 
 mkdir -p "$OUT"
 work="$(mktemp -d)"
@@ -35,12 +40,19 @@ trap 'rm -rf "$work"' EXIT
 : > "$work/daemon.lines"
 : > "$work/cli.lines"
 
-# 把单个文件压成 tar.gz（-n 不写时间戳，便于重建时结果稳定）
+# 把它单个文件压成 tar.gz（-n 不写 gzip 时间戳，便于重建时结果稳定）
+# GNU tar 再额外固定 mtime/uid/gid：这样同一个二进制重打包出的 sha256 完全一样
+# （CI 重跑、或本机/VPS 各打一次包，得到的是同一行 --artifact，不用反复抄新的 sha）
+TAR_REPRO=""
+if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+	TAR_REPRO="--mtime=@0 --owner=0 --group=0 --numeric-owner --sort=name"
+fi
 pack_one() { # $1=源文件  $2=包内文件名  $3=输出路径
 	local stage="$work/stage"
 	rm -rf "$stage" && mkdir -p "$stage"
 	cp -f "$1" "$stage/$2"
-	tar -cf - -C "$stage" "$2" | gzip -9n > "$3"
+	# shellcheck disable=SC2086  # TAR_REPRO 就是要按空格拆开
+	tar -cf - $TAR_REPRO -C "$stage" "$2" | gzip -9n > "$3"
 	sha256sum "$3" | cut -d' ' -f1 > "$3.sha256"
 	ls -l "$3" | awk -v n="$3" '{printf "   %s  %.1f MB\n", n, $5/1048576}'
 }
@@ -170,9 +182,13 @@ CFG="$OUT/ts.conf.local"
 		echo '"'
 	fi
 	echo
-	echo "# 下面两项改成你自己的（留着示例值会被 install.sh / ts-doctor 报警）"
-	echo "LOGIN_SERVER=https://hs.example.com"
-	echo "ADVERTISE_ROUTES=192.168.31.0/24"
+	if [ "$LOGIN_SERVER" = "https://hs.example.com" ] || [ "$ADVERTISE_ROUTES" = "192.168.31.0/24" ]; then
+		echo "# 注意：下面仍是示例值（留着会被 install.sh / ts-doctor 报警），改成你自己的"
+	else
+		echo "# 下面两项来自构建时的 LOGIN_SERVER / ADVERTISE_ROUTES，可直接用"
+	fi
+	echo "LOGIN_SERVER=$LOGIN_SERVER"
+	echo "ADVERTISE_ROUTES=$ADVERTISE_ROUTES"
 } > "$CFG"
 
 echo

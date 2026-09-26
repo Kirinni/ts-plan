@@ -1,0 +1,305 @@
+# 在 GitHub 的机器上编 mipsle 单二进制，编完直接推到你的分发点（VPS）。
+#
+# 也就是说：本机不用装 Go、不用 scp、VPS 上也不用留一份仓库 clone。
+#
+#   Step 1  server/build-selfbuild.sh   编（自带 CLI 行为 / 软浮点 / 静态链接 三项断言）
+#   Step 2  server/make-artifact.sh     打 tar.gz + sha256 + 生成 ts.conf.local
+#   Step 3  server/make-repo-archive.sh 导出仓库快照（路由器安装时也不碰 GitHub）
+#   Step 4  tar over ssh                推到 VPS 分发点，并回头校验分发点上的 sha256
+#
+# 怎么触发：
+#   • Actions 页面手动 Run workflow —— 可填版本号 / 分发前缀 / 是否上传（默认上传）
+#   • 推 tag：git tag v1.102.4 && git push origin v1.102.4
+#     —— 版本号自动取 tag 名，编完自动建 Release + 自动上传
+#   • 改到 server/ router/ .github/ 的 PR —— 只跑脚本检查和编译，不上传
+#
+# 要配的 Secrets / Variables 见 README「三 → 2.5 让 GitHub Actions 干（可选）」。
+name: 构建 mipsle 单二进制
+
+on:
+  workflow_dispatch:
+    inputs:
+      ver:
+        description: Tailscale 版本（不带 v；留空 = tag 名或 TS_VER 变量）
+        type: string
+        default: ""
+      base_url:
+        description: 分发点前缀（留空 = 用 TS_BASE_URL 变量）
+        type: string
+        default: ""
+      deploy:
+        description: 构建完成后上传到 VPS
+        type: boolean
+        default: true
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "server/**"
+      - "router/**"
+      - ".github/**"
+
+# 建 Release 需要写权限，其余只读
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # 分发点前缀：手动输入 > 仓库变量 > 占位值（占位值会被 ts-doctor 警告，提醒你还没配）
+  TS_BASE_URL: ${{ inputs.base_url || vars.TS_BASE_URL || 'https://dl.example.com/ts/CHANGE_ME_TOKEN' }}
+  # 下面两项只用来填进 dist/ts.conf.local 和打印安装命令，非机密
+  TS_LOGIN_SERVER: ${{ vars.TS_LOGIN_SERVER || 'https://hs.example.com' }}
+  TS_ADVERTISE_ROUTES: ${{ vars.TS_ADVERTISE_ROUTES || '192.168.31.0/24' }}
+  TS_VER: ${{ vars.TS_VER }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 脚本语法 + 行尾：Windows 上改脚本很容易带进 CRLF，busybox ash 会当场报错
+  # ---------------------------------------------------------------------------
+  scripts:
+    name: 脚本检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: dash -n / bash -n 全部脚本
+        run: |
+          set -uo pipefail
+          fail=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            if head -n1 "$f" | grep -q bash; then shcmd=bash; else shcmd=sh; fi
+            if ! "$shcmd" -n "$f"; then
+              echo "::error file=$f::$shcmd -n 失败（语法错，或文件带了 CRLF）"
+              fail=1
+            fi
+          done < <(git ls-files 'server/*.sh' 'router/*' | sort -u)
+          [ "$fail" = 0 ] || exit 1
+      - name: 确认脚本里没有 CRLF
+        run: |
+          if git grep -I -l $'\r' -- server router; then
+            echo "::error::上面这些文件里混进了 CRLF —— 路由器上的 busybox ash 会报语法错（检查 .gitattributes）"
+            exit 1
+          fi
+          echo "OK 行尾干净"
+
+  # ---------------------------------------------------------------------------
+  # 编译 → 打包 → 快照 → 上传
+  # ---------------------------------------------------------------------------
+  build:
+    name: 编译并分发
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: scripts
+    permissions:
+      contents: write # 打 tag 时建 Release
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # git archive 要导出快照，拿全历史最省心（仓库很小）
+          fetch-depth: 0
+
+      # build-selfbuild.sh 自己会准备 Go（缺了就下官方 tarball 并校验 sha256），
+      # 这里装一个稳定版只是省掉每次重新下载工具链的时间。
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+
+      - name: 确定版本号与分发前缀
+        id: pick
+        run: |
+          set -euo pipefail
+          ver="${IN_VER:-}"
+          if [ -z "$ver" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            ver="${GITHUB_REF_NAME}"
+          fi
+          [ -n "$ver" ] || ver="${TS_VER:-}"
+          ver="${ver#v}"
+          [ -n "$ver" ] || ver="1.102.4"
+          base="${TS_BASE_URL%/}"
+          ref="$GITHUB_SHA"
+          {
+            echo "ver=$ver"
+            echo "base=$base"
+            echo "ref=$ref"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### 构建 mipsle 单二进制 v$ver"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 版本 | \`$ver\` |"
+            echo "| 分发前缀 | \`$base\` |"
+            echo "| commit | \`$ref\` |"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          IN_VER: ${{ inputs.ver }}
+
+      - name: 编译（含 CLI / 软浮点 / 静态链接断言）
+        env:
+          VER: ${{ steps.pick.outputs.ver }}
+        run: |
+          set -euo pipefail
+          VER="$VER" OUT="$PWD/dist" bash server/build-selfbuild.sh
+
+      - name: 打包 + 生成 ts.conf.local
+        env:
+          VER: ${{ steps.pick.outputs.ver }}
+        run: |
+          set -euo pipefail
+          SOURCE=local BINARY="dist/tailscaled_${VER}_mipsle" OUT=dist \
+            BASE_URL="$TS_BASE_URL" \
+            LOGIN_SERVER="$TS_LOGIN_SERVER" \
+            ADVERTISE_ROUTES="$TS_ADVERTISE_ROUTES" \
+            bash server/make-artifact.sh
+
+      - name: 导出仓库快照（路由器安装时也不用访问 GitHub）
+        env:
+          REF: ${{ steps.pick.outputs.ref }}
+        run: |
+          set -euo pipefail
+          REF="$REF" OUT=dist BASE_URL="$TS_BASE_URL" bash server/make-repo-archive.sh
+
+      - name: 汇总安装命令
+        id: info
+        env:
+          VER: ${{ steps.pick.outputs.ver }}
+          REF: ${{ steps.pick.outputs.ref }}
+          BASE: ${{ steps.pick.outputs.base }}
+        run: |
+          set -euo pipefail
+          tsha="$(cat "dist/tailscaled_${VER}_mipsle.tar.gz.sha256")"
+          asha="$(sha256sum "dist/archive/$REF.tar.gz" | cut -d' ' -f1)"
+
+          # 注意：这里不用 heredoc 写文件 —— YAML 块里每行都必须缩进，而 heredoc 的
+          # 结束标记必须是行首，两者冲突（用 printf 最省事）
+          printf '%s\n' \
+            "GitHub Actions 产出的工件（Tailscale v$VER / mipsle softfloat / 单二进制自带 CLI）" \
+            "" \
+            "分发点里应该有的东西：" \
+            "  bootstrap.sh" \
+            "  ts.conf.local" \
+            "  tailscaled_${VER}_mipsle.tar.gz    sha256 $tsha" \
+            "  archive/$REF.tar.gz                sha256 $asha" \
+            "" \
+            "路由器上一条命令装完（全程不碰 GitHub）：" \
+            "  wget -O- $BASE/bootstrap.sh | sh -s -- \\" \
+            "    --base-url $BASE \\" \
+            "    --ref $REF \\" \
+            "    --sha256 $asha \\" \
+            "    --artifact \"$tsha $BASE/tailscaled_${VER}_mipsle.tar.gz\" \\" \
+            "    --login-server $TS_LOGIN_SERVER \\" \
+            "    --routes $TS_ADVERTISE_ROUTES \\" \
+            "    --authkey -" \
+            "" \
+            "想改配置就别传 --login-server/--routes/--authkey，改成把 ts.conf.local 拷到" \
+            "/etc/tailscale/ts.conf.local（细节见 README「三、从零部署」第 6 步）。" \
+            > dist/INSTALL.txt
+
+          {
+            echo "#### 路由器安装命令（复制即用）"
+            echo
+            echo '```'
+            cat dist/INSTALL.txt
+            echo '```'
+            echo
+            echo "- 工件：\`tailscaled_${VER}_mipsle.tar.gz\`（sha256 \`$tsha\`）"
+            echo "- 快照：\`archive/$REF.tar.gz\`（sha256 \`$asha\`）"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传工件（保留 90 天，可当历史版本回滚）
+        uses: actions/upload-artifact@v7
+        with:
+          name: ts-artifact-mipsle-${{ steps.pick.outputs.ver }}
+          path: dist/**
+          if-no-files-found: error
+
+      - name: 打 tag 时建 / 更新 Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --clobber \
+              dist/*.tar.gz dist/*.sha256 dist/bootstrap.sh dist/INSTALL.txt
+          else
+            gh release create "$GITHUB_REF_NAME" --generate-notes \
+              --title "mipsle 单二进制 $GITHUB_REF_NAME" \
+              dist/*.tar.gz dist/*.sha256 dist/bootstrap.sh dist/INSTALL.txt
+          fi
+
+      # ---------------------------------------------------------------------
+      # 下面两步需要 Secrets；没配就只产出工件，给个明示的提示而不是静默跳过
+      # ---------------------------------------------------------------------
+      - name: 没配 SSH 密钥 → 只产出工件
+        if: env.TS_SSH_KEY == '' && (github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.deploy))
+        env:
+          TS_SSH_KEY: ${{ secrets.TS_SSH_KEY }}
+        run: |
+          echo "::notice title=未上传::没有配置 TS_SSH_KEY / TS_DEPLOY_HOST，本次只在 Actions 里产出工件（dist/），没有推到 VPS。"
+
+      - name: 上传到 VPS 分发点
+        if: env.TS_SSH_KEY != '' && (github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.deploy))
+        env:
+          TS_SSH_KEY: ${{ secrets.TS_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.TS_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.TS_DEPLOY_USER || 'root' }}
+          DEPLOY_PORT: ${{ secrets.TS_DEPLOY_PORT || '22' }}
+          DEPLOY_PATH: ${{ secrets.TS_DEPLOY_PATH || '/srv/ts' }}
+          KNOWN_HOSTS: ${{ secrets.TS_SSH_KNOWN_HOSTS }}
+          VER: ${{ steps.pick.outputs.ver }}
+          BASE: ${{ steps.pick.outputs.base }}
+        run: |
+          set -euo pipefail
+          [ -n "$DEPLOY_HOST" ] || { echo "::error::配了 TS_SSH_KEY 但缺 TS_DEPLOY_HOST"; exit 1; }
+
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          key="$TS_SSH_KEY"
+          # 有人是把私钥挤成一行（\n 字面量）存在 secret 里的，这里兼容一下
+          case "$key" in *'\n'*) key="$(printf '%b' "$key")" ;; esac
+          printf '%s\n' "$key" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          if [ -n "$KNOWN_HOSTS" ]; then
+            printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" > ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+          # tar over ssh：一条连接把 dist/ 整个铺到分发目录，不依赖 VPS 上有 rsync
+          remote="mkdir -p '$DEPLOY_PATH' && tar -xzf - -C '$DEPLOY_PATH' && chmod -R a+rX '$DEPLOY_PATH'"
+          tar -C dist -czf - . | ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" \
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o BatchMode=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" "$remote"
+          echo "   OK 已铺到 $DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH"
+
+          # 回头从分发点下一遍，比对 sha256（顺带验证 nginx 配好了、没被 CDN 缓存旧的）
+          case "$BASE" in
+            "" | *CHANGE_ME_TOKEN*)
+              echo "::notice::TS_BASE_URL 还是占位值，跳过在线校验"
+              ;;
+            *)
+              tmp="$(mktemp -d)"
+              if curl -fsSL --connect-timeout 20 -o "$tmp/a.tar.gz" \
+                   "$BASE/tailscaled_${VER}_mipsle.tar.gz"; then
+                got="$(sha256sum "$tmp/a.tar.gz" | cut -d' ' -f1)"
+                want="$(cat "dist/tailscaled_${VER}_mipsle.tar.gz.sha256")"
+                if [ "$got" != "$want" ]; then
+                  echo "::error::$BASE 上的 tar.gz 和本地编出来的不一致（期望 $want / 实得 $got）"
+                  exit 1
+                fi
+                echo "   OK 分发点上的 tar.gz 与本地一致：$got"
+              else
+                echo "::warning::$BASE 下不动（nginx 还没配好？）—— 文件已经放上去了，自己确认一下"
+              fi
+              ;;
+          esac
+
+          echo "- 已上传到 \`$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH\` ✅" >> "$GITHUB_STEP_SUMMARY"

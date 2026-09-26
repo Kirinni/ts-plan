@@ -10,7 +10,9 @@ authkey
 *.authkey
 
 # 构建产物：单二进制 30.5MB、tar.gz 9.9MB，进仓库只会把体积撑爆
+# dist/ 是 CI（.github/workflows/build.yml）和 make-*-sh 的默认输出目录
 out/
+dist/
 tailscaled_*_mipsle*
 *.tar.gz
 *.sha256
